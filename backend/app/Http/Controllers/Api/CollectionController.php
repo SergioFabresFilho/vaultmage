@@ -33,7 +33,7 @@ class CollectionController extends Controller
         $request->validate(['image' => 'required|string']);
 
         try {
-            $ocrText = $this->vision->extractText($request->input('image'));
+            $ocrText = $this->vision->extractCardText($request->input('image'));
         } catch (RuntimeException $e) {
             Log::error('CloudVision OCR failed', ['error' => $e->getMessage()]);
             throw ValidationException::withMessages(['image' => 'Could not process image: ' . $e->getMessage()]);
@@ -44,19 +44,27 @@ class CollectionController extends Controller
             throw ValidationException::withMessages(['image' => 'No text could be extracted from this image.']);
         }
 
-        ['name' => $name, 'set_code' => $setCode] = $this->parser->parse($ocrText);
+        ['name' => $name, 'set_code' => $setCode, 'collector_number' => $collectorNumber] = $this->parser->parse($ocrText);
 
         if (empty($name)) {
             Log::warning('Card scan OCR produced no card name', ['ocr_text' => $ocrText]);
             throw ValidationException::withMessages(['image' => 'Could not identify a card name from the image. Try better lighting or angle.']);
         }
 
-        Log::info('Card scan OCR parsed', ['name' => $name, 'set_code' => $setCode]);
+        Log::info('Card scan OCR parsed', ['name' => $name, 'set_code' => $setCode, 'collector_number' => $collectorNumber]);
 
         try {
-            $cardData = $this->scryfall->findCard($name, $setCode);
+            if ($setCode && $collectorNumber) {
+                try {
+                    $cardData = $this->scryfall->findCardBySetAndNumber($setCode, $collectorNumber);
+                } catch (RuntimeException) {
+                    $cardData = $this->scryfall->findCard($name, $setCode);
+                }
+            } else {
+                $cardData = $this->scryfall->findCard($name, $setCode);
+            }
         } catch (RuntimeException $e) {
-            Log::warning('Scryfall card lookup failed', ['name' => $name, 'set_code' => $setCode, 'error' => $e->getMessage()]);
+            Log::warning('Scryfall card lookup failed', ['name' => $name, 'set_code' => $setCode, 'collector_number' => $collectorNumber, 'error' => $e->getMessage()]);
             throw ValidationException::withMessages(['image' => $e->getMessage()]);
         }
 
