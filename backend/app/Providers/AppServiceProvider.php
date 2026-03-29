@@ -2,10 +2,8 @@
 
 namespace App\Providers;
 
-use App\Services\CardOcrParser;
-use App\Services\CloudVisionService;
-use App\Services\ScryfallService;
-use Google\Cloud\Vision\V1\ImageAnnotatorClient;
+use Google\Cloud\Vision\V1\Client\ImageAnnotatorClient;
+use Illuminate\Auth\Notifications\ResetPassword;
 use Illuminate\Support\ServiceProvider;
 
 class AppServiceProvider extends ServiceProvider
@@ -16,22 +14,23 @@ class AppServiceProvider extends ServiceProvider
     public function register(): void
     {
         $this->app->singleton(ImageAnnotatorClient::class, function () {
-            $options = ['projectId' => config('services.google_vision.project_id')];
+            $options = [];
 
             $credentials = config('services.google_vision.credentials');
             if ($credentials) {
-                $options['credentials'] = $credentials;
+                // Accept either a file path or an inline JSON string
+                $options['credentials'] = file_exists($credentials)
+                    ? $credentials
+                    : (json_decode($credentials, true) ?? $credentials);
+            }
+
+            $projectId = config('services.google_vision.project_id');
+            if ($projectId) {
+                $options['projectId'] = $projectId;
             }
 
             return new ImageAnnotatorClient($options);
         });
-
-        $this->app->singleton(CloudVisionService::class, function ($app) {
-            return new CloudVisionService($app->make(ImageAnnotatorClient::class));
-        });
-
-        $this->app->singleton(ScryfallService::class);
-        $this->app->singleton(CardOcrParser::class);
     }
 
     /**
@@ -39,6 +38,8 @@ class AppServiceProvider extends ServiceProvider
      */
     public function boot(): void
     {
-        //
+        ResetPassword::createUrlUsing(function (object $notifiable, string $token) {
+            return config('app.frontend_url')."/password-reset/$token?email={$notifiable->getEmailForPasswordReset()}";
+        });
     }
 }

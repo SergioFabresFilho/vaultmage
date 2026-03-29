@@ -9,6 +9,7 @@ use App\Services\CloudVisionService;
 use App\Services\ScryfallService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Validation\ValidationException;
 use RuntimeException;
 
@@ -31,17 +32,31 @@ class CollectionController extends Controller
     {
         $request->validate(['image' => 'required|string']);
 
-        $ocrText = $this->vision->extractText($request->input('image'));
+        try {
+            $ocrText = $this->vision->extractText($request->input('image'));
+        } catch (RuntimeException $e) {
+            Log::error('CloudVision OCR failed', ['error' => $e->getMessage()]);
+            throw ValidationException::withMessages(['image' => 'Could not process image: ' . $e->getMessage()]);
+        }
 
         if (empty($ocrText)) {
+            Log::warning('CloudVision returned no text from scan image');
             throw ValidationException::withMessages(['image' => 'No text could be extracted from this image.']);
         }
 
         ['name' => $name, 'set_code' => $setCode] = $this->parser->parse($ocrText);
 
+        if (empty($name)) {
+            Log::warning('Card scan OCR produced no card name', ['ocr_text' => $ocrText]);
+            throw ValidationException::withMessages(['image' => 'Could not identify a card name from the image. Try better lighting or angle.']);
+        }
+
+        Log::info('Card scan OCR parsed', ['name' => $name, 'set_code' => $setCode]);
+
         try {
             $cardData = $this->scryfall->findCard($name, $setCode);
         } catch (RuntimeException $e) {
+            Log::warning('Scryfall card lookup failed', ['name' => $name, 'set_code' => $setCode, 'error' => $e->getMessage()]);
             throw ValidationException::withMessages(['image' => $e->getMessage()]);
         }
 
@@ -111,6 +126,10 @@ class CollectionController extends Controller
     private function fetchByScryfallId(string $scryfallId): array
     {
         $response = \Illuminate\Support\Facades\Http::baseUrl('https://api.scryfall.com')
+            ->withHeaders([
+                'User-Agent' => 'VaultMage/1.0 (contact@vaultmage.app)',
+                'Accept'     => 'application/json;q=0.9,*/*;q=0.8',
+            ])
             ->get("/cards/{$scryfallId}");
 
         if (! $response->ok()) {

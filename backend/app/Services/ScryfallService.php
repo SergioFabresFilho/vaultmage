@@ -4,6 +4,7 @@ namespace App\Services;
 
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use RuntimeException;
 
 class ScryfallService
@@ -29,13 +30,22 @@ class ScryfallService
             }
 
             $response = Http::baseUrl(self::BASE_URL)
+                ->withHeaders([
+                    'User-Agent' => 'VaultMage/1.0 (contact@vaultmage.app)',
+                    'Accept'     => 'application/json;q=0.9,*/*;q=0.8',
+                ])
                 ->get('/cards/named', $params);
 
             if ($response->status() === 404) {
+                Log::warning('Scryfall card not found', ['name' => $name, 'set_code' => $setCode]);
                 throw new RuntimeException("Card not found: \"{$name}\"" . ($setCode ? " in set {$setCode}" : ''));
             }
 
-            $response->throw();
+            if (! $response->ok()) {
+                $detail = $response->json('details') ?? $response->json('message') ?? 'Unknown Scryfall error';
+                Log::error('Scryfall API request failed', ['name' => $name, 'set_code' => $setCode, 'status' => $response->status(), 'detail' => $detail]);
+                throw new RuntimeException("Scryfall error ({$response->status()}): {$detail}");
+            }
 
             $data = $response->json();
 
