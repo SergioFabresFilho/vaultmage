@@ -24,6 +24,17 @@ export default function ScanScreen() {
   const cameraRef = useRef<CameraView>(null);
   const flashOpacity = useRef(new Animated.Value(0)).current;
   const [isCameraActive, setIsCameraActive] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const toastOpacity = useRef(new Animated.Value(0)).current;
+
+  function showToast(message: string) {
+    setToastMessage(message);
+    Animated.sequence([
+      Animated.timing(toastOpacity, { toValue: 1, duration: 200, useNativeDriver: true }),
+      Animated.delay(2000),
+      Animated.timing(toastOpacity, { toValue: 0, duration: 300, useNativeDriver: true }),
+    ]).start(() => setToastMessage(null));
+  }
 
   useFocusEffect(
     useCallback(() => {
@@ -112,7 +123,7 @@ export default function ScanScreen() {
         return;
       }
       setIdentifiedCard(null);
-      Alert.alert('Added!', `${identifiedCard.name} added to your collection.`);
+      showToast(`${identifiedCard.name} added to your collection.`);
     } catch (e: any) {
       Alert.alert('Error', e.message ?? 'Something went wrong.');
     } finally {
@@ -213,6 +224,12 @@ export default function ScanScreen() {
           </View>
         </View>
       </Modal>
+
+      {toastMessage !== null && (
+        <Animated.View style={[styles.toast, { opacity: toastOpacity }]} pointerEvents="none">
+          <Text style={styles.toastText}>{toastMessage}</Text>
+        </Animated.View>
+      )}
     </View>
   );
 }
@@ -433,5 +450,23 @@ const styles = StyleSheet.create({
     color: '#ccc',
     fontWeight: '600',
     fontSize: 15,
+  },
+
+  // Toast notification
+  toast: {
+    position: 'absolute',
+    top: 60,
+    alignSelf: 'center',
+    backgroundColor: 'rgba(30, 30, 50, 0.92)',
+    paddingVertical: 10,
+    paddingHorizontal: 20,
+    borderRadius: 24,
+    borderWidth: 1,
+    borderColor: '#6C3CE1',
+  },
+  toastText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '500',
   },
 });
