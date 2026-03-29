@@ -131,6 +131,26 @@ class CollectionController extends Controller
         return response()->json($cards);
     }
 
+    /**
+     * Search the authenticated user's collection by card name.
+     *
+     * GET /api/collection/search?q=...
+     */
+    public function search(Request $request): JsonResponse
+    {
+        $query = $request->query('q');
+
+        if (empty($query)) {
+            return response()->json([]);
+        }
+
+        $cards = $request->user()->collection()
+            ->where('name', 'LIKE', "%{$query}%")
+            ->get();
+
+        return response()->json($cards);
+    }
+
     private function fetchByScryfallId(string $scryfallId): array
     {
         $response = \Illuminate\Support\Facades\Http::baseUrl('https://api.scryfall.com')

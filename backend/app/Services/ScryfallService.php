@@ -89,6 +89,41 @@ class ScryfallService
         });
     }
 
+    /**
+     * Search for cards matching a query.
+     *
+     * Uses GET /cards/search?q=...
+     *
+     * @return array<array{scryfall_id:string, name:string, set_code:string, set_name:string, collector_number:string, rarity:string, mana_cost:string|null, type_line:string, image_uri:string|null}>
+     */
+    public function search(string $query): array
+    {
+        $cacheKey = 'scryfall:search:' . urlencode($query);
+
+        return Cache::rememberForever($cacheKey, function () use ($query) {
+            $response = Http::baseUrl(self::BASE_URL)
+                ->withHeaders([
+                    'User-Agent' => 'VaultMage/1.0 (contact@vaultmage.app)',
+                    'Accept'     => 'application/json;q=0.9,*/*;q=0.8',
+                ])
+                ->get('/cards/search', ['q' => $query]);
+
+            if ($response->status() === 404) {
+                return [];
+            }
+
+            if (! $response->ok()) {
+                $detail = $response->json('details') ?? $response->json('message') ?? 'Unknown Scryfall error';
+                Log::error('Scryfall API search failed', ['query' => $query, 'status' => $response->status(), 'detail' => $detail]);
+                throw new RuntimeException("Scryfall error ({$response->status()}): {$detail}");
+            }
+
+            $data = $response->json('data');
+
+            return array_map([$this, 'mapCardData'], $data);
+        });
+    }
+
     private function mapCardData(array $data): array
     {
         return [
