@@ -1,8 +1,16 @@
 import { CameraView, useCameraPermissions } from 'expo-camera';
-import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { useRef, useState } from 'react';
+import { Animated, ActivityIndicator, Alert, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { useAuth } from '@/context/AuthContext';
+
+const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:8000';
 
 export default function ScanScreen() {
+  const { token } = useAuth();
   const [permission, requestPermission] = useCameraPermissions();
+  const [scanning, setScanning] = useState(false);
+  const cameraRef = useRef<CameraView>(null);
+  const flashOpacity = useRef(new Animated.Value(0)).current;
 
   if (!permission) {
     return <View style={styles.container} />;
@@ -21,9 +29,50 @@ export default function ScanScreen() {
     );
   }
 
+  function triggerShutter() {
+    flashOpacity.setValue(1);
+    Animated.timing(flashOpacity, {
+      toValue: 0,
+      duration: 300,
+      useNativeDriver: true,
+    }).start();
+  }
+
+  async function handleScan() {
+    if (!cameraRef.current || scanning) return;
+    triggerShutter();
+    setScanning(true);
+    try {
+      const photo = await cameraRef.current.takePictureAsync({ base64: true, quality: 0.8 });
+      if (!photo?.base64) throw new Error('Failed to capture image.');
+
+      const response = await fetch(`${API_BASE_URL}/api/collection/scan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ image: photo.base64 }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        const message = data?.message ?? data?.errors?.image?.[0] ?? 'Scan failed.';
+        console.error('[scan] API error:', { status: response.status, message, errors: data?.errors });
+        Alert.alert('Could not identify card', message);
+        return;
+      }
+
+      Alert.alert('Card found', data.name);
+    } catch (e: any) {
+      console.error('[scan] Unexpected error during scan:', e);
+      Alert.alert('Error', e.message ?? 'Something went wrong.');
+    } finally {
+      setScanning(false);
+    }
+  }
+
   return (
     <View style={styles.container}>
-      <CameraView style={StyleSheet.absoluteFill} facing="back" />
+      <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" />
 
       {/* Dimmed overlay with card frame cutout */}
       <View style={StyleSheet.absoluteFill} pointerEvents="none">
@@ -47,9 +96,24 @@ export default function ScanScreen() {
         <View style={styles.dimBottom} />
       </View>
 
+      {/* Shutter flash overlay */}
+      <Animated.View
+        style={[StyleSheet.absoluteFill, styles.shutterFlash, { opacity: flashOpacity }]}
+        pointerEvents="none"
+      />
+
       <View style={styles.hint}>
-        <Text style={styles.hintText}>Align card within the frame</Text>
+        <Text style={styles.hintText}>
+          {scanning ? 'Identifying card…' : 'Align card within the frame'}
+        </Text>
       </View>
+
+      <TouchableOpacity style={styles.scanButton} onPress={handleScan} disabled={scanning}>
+        {scanning
+          ? <ActivityIndicator color="#000" size="large" />
+          : <View style={styles.scanButtonInner} />
+        }
+      </TouchableOpacity>
     </View>
   );
 }
@@ -152,10 +216,36 @@ const styles = StyleSheet.create({
     borderBottomRightRadius: 4,
   },
 
+  // Shutter flash
+  shutterFlash: {
+    backgroundColor: '#fff',
+    zIndex: 10,
+  },
+
+  // Scan button
+  scanButton: {
+    position: 'absolute',
+    bottom: 40,
+    alignSelf: 'center',
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    borderWidth: 4,
+    borderColor: '#fff',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  scanButtonInner: {
+    width: 54,
+    height: 54,
+    borderRadius: 27,
+    backgroundColor: '#fff',
+  },
+
   // Hint label
   hint: {
     position: 'absolute',
-    bottom: 60,
+    bottom: 130,
     alignSelf: 'center',
     backgroundColor: 'rgba(0,0,0,0.5)',
     paddingVertical: 6,
