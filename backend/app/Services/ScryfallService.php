@@ -50,6 +50,42 @@ class ScryfallService
     }
 
     /**
+     * Find a card by Scryfall ID.
+     *
+     * Uses GET /cards/{id} for a precise match.
+     *
+     * @return array{scryfall_id:string, name:string, set_code:string, set_name:string, collector_number:string, rarity:string, mana_cost:string|null, type_line:string, image_uri:string|null}
+     *
+     * @throws RuntimeException when card is not found
+     */
+    public function findCardById(string $id): array
+    {
+        $cacheKey = 'scryfall:id:' . $id;
+
+        return Cache::rememberForever($cacheKey, function () use ($id) {
+            $response = Http::baseUrl(self::BASE_URL)
+                ->withHeaders([
+                    'User-Agent' => 'VaultMage/1.0 (contact@vaultmage.app)',
+                    'Accept'     => 'application/json;q=0.9,*/*;q=0.8',
+                ])
+                ->get("/cards/{$id}");
+
+            if ($response->status() === 404) {
+                Log::warning('Scryfall card not found by ID', ['id' => $id]);
+                throw new RuntimeException("Card not found: \"{$id}\"");
+            }
+
+            if (! $response->ok()) {
+                $detail = $response->json('details') ?? $response->json('message') ?? 'Unknown Scryfall error';
+                Log::error('Scryfall API request failed', ['id' => $id, 'status' => $response->status(), 'detail' => $detail]);
+                throw new RuntimeException("Scryfall error ({$response->status()}): {$detail}");
+            }
+
+            return $this->mapCardData($response->json());
+        });
+    }
+
+    /**
      * Find a card by name (fuzzy) and optional set code.
      *
      * @return array{scryfall_id:string, name:string, set_code:string, set_name:string, collector_number:string, rarity:string, mana_cost:string|null, type_line:string, image_uri:string|null}

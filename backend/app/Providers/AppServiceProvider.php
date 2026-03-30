@@ -2,6 +2,10 @@
 
 namespace App\Providers;
 
+use App\Contracts\OcrClient;
+use App\Contracts\VisionClientInterface;
+use App\Services\GoogleOcrClient;
+use App\Services\GoogleVisionClientAdapter;
 use Google\Cloud\Vision\V1\Client\ImageAnnotatorClient;
 use Illuminate\Auth\Notifications\ResetPassword;
 use Illuminate\Support\ServiceProvider;
@@ -31,6 +35,9 @@ class AppServiceProvider extends ServiceProvider
 
             return new ImageAnnotatorClient($options);
         });
+
+        $this->app->singleton(VisionClientInterface::class, GoogleVisionClientAdapter::class);
+        $this->app->singleton(OcrClient::class, GoogleOcrClient::class);
     }
 
     /**

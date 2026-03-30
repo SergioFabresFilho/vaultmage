@@ -80,16 +80,11 @@ class CollectionController extends Controller
     public function store(Request $request): JsonResponse
     {
         $request->validate([
-            'scryfall_id' => 'required|string',
+            'scryfall_id' => 'required|uuid',
             'foil'        => 'boolean',
         ]);
 
-        try {
-            $cardData = $this->scryfall->findCard($request->input('scryfall_id'));
-        } catch (RuntimeException $e) {
-            // Fall back to direct Scryfall ID lookup if findCard by name fails
-            $cardData = $this->fetchByScryfallId($request->input('scryfall_id'));
-        }
+        $cardData = $this->fetchByScryfallId($request->input('scryfall_id'));
 
         $card = Card::firstOrCreate(
             ['scryfall_id' => $cardData['scryfall_id']],
@@ -132,6 +127,42 @@ class CollectionController extends Controller
     }
 
     /**
+     * Update the quantity of a card in the authenticated user's collection.
+     *
+     * PATCH /api/collection/{card}
+     * Body: { quantity: N, foil: false }
+     */
+    public function update(Request $request, Card $card): JsonResponse
+    {
+        $request->validate([
+            'quantity' => 'required|integer|min:0',
+            'foil'     => 'boolean',
+        ]);
+
+        $user     = $request->user();
+        $foil     = $request->boolean('foil');
+        $quantity = $request->integer('quantity');
+
+        if ($quantity <= 0) {
+            \DB::table('collection_cards')
+                ->where('user_id', $user->id)
+                ->where('card_id', $card->id)
+                ->where('foil', $foil)
+                ->delete();
+
+            return response()->json(['message' => 'Card removed from collection']);
+        }
+
+        \DB::table('collection_cards')
+            ->where('user_id', $user->id)
+            ->where('card_id', $card->id)
+            ->where('foil', $foil)
+            ->update(['quantity' => $quantity, 'updated_at' => now()]);
+
+        return response()->json(['quantity' => $quantity]);
+    }
+
+    /**
      * Search the authenticated user's collection by card name.
      *
      * GET /api/collection/search?q=...
@@ -153,30 +184,6 @@ class CollectionController extends Controller
 
     private function fetchByScryfallId(string $scryfallId): array
     {
-        $response = \Illuminate\Support\Facades\Http::baseUrl('https://api.scryfall.com')
-            ->withHeaders([
-                'User-Agent' => 'VaultMage/1.0 (contact@vaultmage.app)',
-                'Accept'     => 'application/json;q=0.9,*/*;q=0.8',
-            ])
-            ->get("/cards/{$scryfallId}");
-
-        if (! $response->ok()) {
-            throw new RuntimeException("Card not found for Scryfall ID: {$scryfallId}");
-        }
-
-        $data = $response->json();
-
-        return [
-            'scryfall_id'      => $data['id'],
-            'name'             => $data['name'],
-            'set_code'         => strtoupper($data['set']),
-            'set_name'         => $data['set_name'],
-            'collector_number' => $data['collector_number'],
-            'rarity'           => $data['rarity'],
-            'mana_cost'        => $data['mana_cost'] ?? null,
-            'color_identity'   => $data['color_identity'],
-            'type_line'        => $data['type_line'],
-            'image_uri'        => $data['image_uris']['normal'] ?? $data['card_faces'][0]['image_uris']['normal'] ?? null,
-        ];
+        return $this->scryfall->findCardById($scryfallId);
     }
 }

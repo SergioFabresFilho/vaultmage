@@ -83,4 +83,15 @@ class CardSearchTest extends TestCase
             ->assertJsonFragment(['name' => 'Lightning Bolt'])
             ->assertJsonMissing(['name' => 'Counterspell']);
     }
+
+    public function test_it_returns_empty_array_for_empty_query()
+    {
+        $user = User::factory()->create();
+
+        $response = $this->actingAs($user)
+            ->getJson('/api/cards/search?q=');
+
+        $response->assertStatus(200)
+            ->assertJsonCount(0);
+    }
 }

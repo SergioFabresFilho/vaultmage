@@ -18,7 +18,30 @@ class RegistrationTest extends TestCase
             'password_confirmation' => 'password',
         ]);
 
-        $this->assertAuthenticated();
-        $response->assertNoContent();
+        $response->assertStatus(201)
+            ->assertJsonStructure(['token']);
+    }
+
+    public function test_registration_fails_with_missing_fields(): void
+    {
+        $response = $this->postJson('/register', []);
+
+        $response->assertStatus(422)
+            ->assertJsonValidationErrors(['name', 'email', 'password']);
+    }
+
+    public function test_registration_fails_with_taken_email(): void
+    {
+        \App\Models\User::factory()->create(['email' => 'taken@example.com']);
+
+        $response = $this->postJson('/register', [
+            'name' => 'Another User',
+            'email' => 'taken@example.com',
+            'password' => 'password',
+            'password_confirmation' => 'password',
+        ]);
+
+        $response->assertStatus(422)
+            ->assertJsonValidationErrors(['email']);
     }
 }

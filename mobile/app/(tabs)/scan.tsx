@@ -243,7 +243,7 @@ const CORNER_COLOR = '#fff';
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#000',
+    backgroundColor: '#0f0f1a',
     alignItems: 'center',
     justifyContent: 'center',
   },

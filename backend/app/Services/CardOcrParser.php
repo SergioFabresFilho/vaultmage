@@ -50,22 +50,22 @@ class CardOcrParser
     private function extractSetInfo(string $text): array
     {
         // "M21 · 123/274"
-        if (preg_match('/\b([A-Z0-9]{2,4})\s*[·•\-]\s*(\d+)\/\d+/i', $text, $m)) {
+        if (preg_match('/\b([A-Z0-9]{2,4})\s*[·•\-]\s*(\d+)\/\d+/iu', $text, $m)) {
             return ['set_code' => strtoupper($m[1]), 'collector_number' => $m[2]];
         }
 
         // "123/274 · M21"
-        if (preg_match('/(\d+)\/\d+\s*[·•\-]\s*([A-Z0-9]{2,4})\b/i', $text, $m)) {
+        if (preg_match('/(\d+)\/\d+\s*[·•\-]\s*([A-Z0-9]{2,4})\b/iu', $text, $m)) {
             return ['set_code' => strtoupper($m[2]), 'collector_number' => $m[1]];
         }
 
         // "174/361 C CMR PT ..." — rarity letter separates collector from set code (same line)
-        if (preg_match('/(\d+)\/\d+\s+[CURMTS]\s+([A-Z][A-Z0-9]{1,3})\b/i', $text, $m)) {
+        if (preg_match('/(\d+)\/\d+\s+[CURMTS]\s+([A-Z][A-Z0-9]{1,3})\b/iu', $text, $m)) {
             return ['set_code' => strtoupper($m[2]), 'collector_number' => $m[1]];
         }
 
         // "174/361 C\nCMR PT ..." — set code is first token on the line after the collector line
-        if (preg_match('/(\d+)\/\d+[^\n]*\n\s*([A-Z][A-Z0-9]{1,3})\b/', $text, $m)) {
+        if (preg_match('/(\d+)\/\d+[^\n]*\n\s*([A-Z][A-Z0-9]{1,3})\b/u', $text, $m)) {
             return ['set_code' => strtoupper($m[2]), 'collector_number' => $m[1]];
         }
 

@@ -13,13 +13,18 @@ import {
   KeyboardAvoidingView,
   Platform,
   Alert,
+  ScrollView,
+  Dimensions,
 } from 'react-native';
+import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuth } from '@/context/AuthContext';
 
+const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:8000';
 
 type Card = {
+  id?: number;
   scryfall_id: string;
   name: string;
   set_code: string;
@@ -32,6 +37,13 @@ type Card = {
   color_identity?: string[];
 };
 
+type Deck = {
+  id: number;
+  name: string;
+  format: string | null;
+  cards_count: number;
+};
+
 type SearchMode = 'all' | 'collection';
 
 function ManaCost({ cost, size = 14 }: { cost: string | null; size?: number }) {
@@ -42,12 +54,7 @@ function ManaCost({ cost, size = 14 }: { cost: string | null; size?: number }) {
   return (
     <View style={styles.manaCostContainer}>
       {symbols.map((s, i) => {
-        // Scryfall symbol format: {W}, {10}, {W/U}, {W/P}
-        // URL format: https://svgs.scryfall.io/card-symbols/W.svg
-        // We remove { } and / for the URL
         const name = s.slice(1, -1).replace(/\//g, '').toUpperCase();
-        
-        // Use weserv.nl to proxy Scryfall SVGs as PNGs for React Native compatibility
         const svgUrl = `https://svgs.scryfall.io/card-symbols/${name}.svg`;
         const uri = `https://images.weserv.nl/?url=${encodeURIComponent(svgUrl)}&output=png&w=${size * 2}`;
 
@@ -66,6 +73,7 @@ function ManaCost({ cost, size = 14 }: { cost: string | null; size?: number }) {
 
 export default function SearchScreen() {
   const { token } = useAuth();
+  const router = useRouter();
   const [query, setQuery] = useState('');
   const [debouncedQuery, setDebouncedQuery] = useState('');
   const [mode, setMode] = useState<SearchMode>('all');
@@ -74,6 +82,11 @@ export default function SearchScreen() {
   const [error, setError] = useState<string | null>(null);
   const [selectedCard, setSelectedCard] = useState<Card | null>(null);
   const [adding, setAdding] = useState(false);
+  
+  // Deck selection state
+  const [decks, setDecks] = useState<Deck[]>([]);
+  const [showDeckPicker, setShowDeckPicker] = useState(false);
+  const [loadingDecks, setLoadingDecks] = useState(false);
 
   // Debounce query
   useEffect(() => {
@@ -118,6 +131,60 @@ export default function SearchScreen() {
   useEffect(() => {
     performSearch(debouncedQuery, mode);
   }, [debouncedQuery, mode, performSearch]);
+
+  const fetchDecks = async () => {
+    setLoadingDecks(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/decks`, {
+        headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
+      });
+      if (response.ok) {
+        const data = await response.json();
+        setDecks(data);
+      }
+    } catch (error) {
+      console.error(error);
+    } finally {
+      setLoadingDecks(false);
+    }
+  };
+
+  const handleOpenDeckPicker = () => {
+    fetchDecks();
+    setShowDeckPicker(true);
+  };
+
+  const addToDeck = async (deckId: number) => {
+    if (!selectedCard) return;
+    
+    setAdding(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/decks/${deckId}/cards`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          scryfall_id: selectedCard.scryfall_id,
+          quantity: 1,
+        }),
+      });
+
+      if (response.ok) {
+        Alert.alert('Success', `${selectedCard.name} added to deck!`);
+        setShowDeckPicker(false);
+        setSelectedCard(null);
+      } else {
+        throw new Error('Failed to add to deck');
+      }
+    } catch (err) {
+      Alert.alert('Error', 'Could not add card to deck.');
+    } finally {
+      setAdding(false);
+    }
+  };
 
   const addToCollection = async (card: Card) => {
     setAdding(true);
@@ -241,6 +308,7 @@ export default function SearchScreen() {
         )}
       </KeyboardAvoidingView>
 
+      {/* Card Detail Modal */}
       <Modal
         visible={!!selectedCard}
         animationType="slide"
@@ -251,21 +319,23 @@ export default function SearchScreen() {
           <View style={styles.modalContent}>
             {selectedCard && (
               <>
-                <TouchableOpacity
-                  style={styles.closeButton}
-                  onPress={() => setSelectedCard(null)}
-                >
-                  <Ionicons name="close" size={24} color="#fff" />
-                </TouchableOpacity>
+                <View style={styles.modalHeader}>
+                  <Text style={styles.modalTitle} numberOfLines={1}>{selectedCard.name}</Text>
+                  <TouchableOpacity
+                    style={styles.closeButton}
+                    onPress={() => setSelectedCard(null)}
+                  >
+                    <Ionicons name="close" size={24} color="#fff" />
+                  </TouchableOpacity>
+                </View>
 
-                <View style={styles.modalScroll}>
+                <ScrollView contentContainerStyle={styles.modalScroll}>
                   <Image
                     source={{ uri: selectedCard.image_uri || '' }}
                     style={styles.modalImage}
                     resizeMode="contain"
                   />
                   <View style={styles.modalInfo}>
-                    <Text style={styles.modalName}>{selectedCard.name}</Text>
                     <View style={{ marginBottom: 8 }}>
                       <ManaCost cost={selectedCard.mana_cost} size={20} />
                     </View>
@@ -275,25 +345,93 @@ export default function SearchScreen() {
                     </Text>
                   </View>
 
-                  <TouchableOpacity
-                    style={styles.addButton}
-                    onPress={() => addToCollection(selectedCard)}
-                    disabled={adding}
-                  >
-                    {adding ? (
-                      <ActivityIndicator color="#fff" />
-                    ) : (
-                      <>
-                        <Ionicons name="add" size={20} color="#fff" />
-                        <Text style={styles.addButtonText}>Add to Collection</Text>
-                      </>
-                    )}
-                  </TouchableOpacity>
-                </View>
+                  <View style={styles.actionButtons}>
+                    <TouchableOpacity
+                      style={styles.actionButton}
+                      onPress={() => addToCollection(selectedCard)}
+                      disabled={adding}
+                    >
+                      {adding ? (
+                        <ActivityIndicator color="#fff" />
+                      ) : (
+                        <>
+                          <Ionicons name="library" size={20} color="#fff" />
+                          <Text style={styles.actionButtonText}>Collection</Text>
+                        </>
+                      )}
+                    </TouchableOpacity>
+
+                    <TouchableOpacity
+                      style={[styles.actionButton, { backgroundColor: '#2a2a3e' }]}
+                      onPress={handleOpenDeckPicker}
+                      disabled={adding}
+                    >
+                      <Ionicons name="albums" size={20} color="#fff" />
+                      <Text style={styles.actionButtonText}>Add to Deck</Text>
+                    </TouchableOpacity>
+                  </View>
+                </ScrollView>
               </>
             )}
           </View>
         </View>
+
+        {/* Deck Picker Overlay */}
+        <Modal
+          visible={showDeckPicker}
+          animationType="fade"
+          transparent={true}
+          onRequestClose={() => setShowDeckPicker(false)}
+        >
+          <View style={styles.pickerOverlay}>
+            <View style={styles.pickerContent}>
+              <View style={styles.pickerHeader}>
+                <Text style={styles.pickerTitle}>Choose a Deck</Text>
+                <TouchableOpacity onPress={() => setShowDeckPicker(false)}>
+                  <Ionicons name="close" size={24} color="#fff" />
+                </TouchableOpacity>
+              </View>
+
+              {loadingDecks ? (
+                <ActivityIndicator color="#6C3CE1" style={{ marginVertical: 40 }} />
+              ) : decks.length === 0 ? (
+                <View style={styles.emptyPicker}>
+                  <Text style={styles.emptyPickerText}>You don't have any decks yet.</Text>
+                  <TouchableOpacity 
+                    style={styles.createDeckLink}
+                    onPress={() => {
+                      setShowDeckPicker(false);
+                      setSelectedCard(null);
+                      router.push('/(tabs)/decks');
+                    }}
+                  >
+                    <Text style={styles.createDeckLinkText}>Create your first deck</Text>
+                  </TouchableOpacity>
+                </View>
+              ) : (
+                <FlatList
+                  data={decks}
+                  keyExtractor={(item) => item.id.toString()}
+                  renderItem={({ item }) => (
+                    <TouchableOpacity 
+                      style={styles.deckSelectItem}
+                      onPress={() => addToDeck(item.id)}
+                    >
+                      <View>
+                        <Text style={styles.deckSelectName}>{item.name}</Text>
+                        <Text style={styles.deckSelectMeta}>
+                          {item.format ? item.format.toUpperCase() : 'CASUAL'} • {item.cards_count} cards
+                        </Text>
+                      </View>
+                      <Ionicons name="add-circle" size={24} color="#6C3CE1" />
+                    </TouchableOpacity>
+                  )}
+                  style={{ maxHeight: 400 }}
+                />
+              )}
+            </View>
+          </View>
+        </Modal>
       </Modal>
     </SafeAreaView>
   );
@@ -427,17 +565,29 @@ const styles = StyleSheet.create({
   },
   modalContent: {
     backgroundColor: '#1a1a2e',
-    borderTopLeftRadius: 20,
-    borderTopRightRadius: 20,
-    paddingTop: 20,
-    paddingBottom: 40,
-    maxHeight: '90%',
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    paddingTop: 16,
+    paddingBottom: Platform.OS === 'ios' ? 40 : 20,
+    height: '85%',
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+    paddingBottom: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#2a2a3e',
+  },
+  modalTitle: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: '700',
+    flex: 1,
+    marginRight: 10,
   },
   closeButton: {
-    position: 'absolute',
-    top: 16,
-    right: 16,
-    zIndex: 10,
     width: 32,
     height: 32,
     borderRadius: 16,
@@ -446,12 +596,12 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   modalScroll: {
-    paddingHorizontal: 20,
+    padding: 20,
     alignItems: 'center',
   },
   modalImage: {
-    width: 250,
-    height: 350,
+    width: SCREEN_WIDTH * 0.7,
+    height: (SCREEN_WIDTH * 0.7) * 1.4,
     borderRadius: 12,
     marginBottom: 20,
   },
@@ -477,20 +627,91 @@ const styles = StyleSheet.create({
     fontSize: 14,
     textAlign: 'center',
   },
-  addButton: {
+  actionButtons: {
+    flexDirection: 'row',
+    gap: 12,
+    width: '100%',
+    paddingBottom: 20,
+  },
+  actionButton: {
+    flex: 1,
     backgroundColor: '#6C3CE1',
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
     paddingVertical: 14,
-    paddingHorizontal: 32,
-    borderRadius: 10,
-    width: '100%',
+    borderRadius: 12,
   },
-  addButtonText: {
+  actionButtonText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '600',
+    marginLeft: 8,
+  },
+
+  // Picker Styles
+  pickerOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.8)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 20,
+  },
+  pickerContent: {
+    backgroundColor: '#1a1a2e',
+    borderRadius: 16,
+    width: '100%',
+    padding: 20,
+    borderWidth: 1,
+    borderColor: '#2a2a3e',
+  },
+  pickerHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  pickerTitle: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: '700',
+  },
+  deckSelectItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#2a2a3e',
+  },
+  deckSelectName: {
     color: '#fff',
     fontSize: 16,
     fontWeight: '600',
-    marginLeft: 8,
+    marginBottom: 2,
+  },
+  deckSelectMeta: {
+    color: '#888',
+    fontSize: 12,
+  },
+  emptyPicker: {
+    paddingVertical: 20,
+    alignItems: 'center',
+  },
+  emptyPickerText: {
+    color: '#888',
+    marginBottom: 12,
+  },
+  createDeckLink: {
+    padding: 8,
+  },
+  createDeckLinkText: {
+    color: '#6C3CE1',
+    fontWeight: '600',
+  },
+  manaCostContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
 });
