@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -10,11 +10,13 @@ import {
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   View,
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
+import { SvgUri } from 'react-native-svg';
 import { useAuth } from '@/context/AuthContext';
 
 const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:8000';
@@ -28,6 +30,8 @@ type CollectionCard = {
   set_code: string;
   rarity: string;
   type_line: string;
+  mana_cost: string | null;
+  color_identity: string[];
   image_uri: string | null;
   pivot: {
     quantity: number;
@@ -42,6 +46,91 @@ type Deck = {
   cards_count: number;
 };
 
+// ─── Color filter config ───────────────────────────────────────────────────
+
+type ColorFilter = 'all' | 'W' | 'U' | 'B' | 'R' | 'G' | 'M' | 'C';
+
+const MANA_ICON_URL: Partial<Record<ColorFilter, string>> = {
+  W: 'https://svgs.scryfall.io/card-symbols/W.svg',
+  U: 'https://svgs.scryfall.io/card-symbols/U.svg',
+  B: 'https://svgs.scryfall.io/card-symbols/B.svg',
+  R: 'https://svgs.scryfall.io/card-symbols/R.svg',
+  G: 'https://svgs.scryfall.io/card-symbols/G.svg',
+  C: 'https://svgs.scryfall.io/card-symbols/C.svg',
+};
+
+const COLOR_FILTERS: { key: ColorFilter; label: string; bg: string; border: string; text: string }[] = [
+  { key: 'all', label: 'All',   bg: '#2a2a3e', border: '#444', text: '#fff' },
+  { key: 'W',   label: 'W',    bg: '#2a2a3e', border: '#444', text: '#fff' },
+  { key: 'U',   label: 'U',    bg: '#2a2a3e', border: '#444', text: '#fff' },
+  { key: 'B',   label: 'B',    bg: '#2a2a3e', border: '#444', text: '#fff' },
+  { key: 'R',   label: 'R',    bg: '#2a2a3e', border: '#444', text: '#fff' },
+  { key: 'G',   label: 'G',    bg: '#2a2a3e', border: '#444', text: '#fff' },
+  { key: 'M',   label: 'Multi', bg: '#c8960c', border: '#a07a08', text: '#fff' },
+  { key: 'C',   label: 'C',    bg: '#2a2a3e', border: '#444', text: '#fff' },
+];
+
+function matchesColor(card: CollectionCard, filter: ColorFilter): boolean {
+  if (filter === 'all') return true;
+  const ci = card.color_identity ?? [];
+  if (filter === 'C') return ci.length === 0;
+  if (filter === 'M') return ci.length >= 2;
+  return ci.length === 1 && ci[0] === filter;
+}
+
+// ─── Card type grouping ────────────────────────────────────────────────────
+
+const TYPE_ORDER = [
+  'Planeswalker',
+  'Creature',
+  'Battle',
+  'Instant',
+  'Sorcery',
+  'Enchantment',
+  'Artifact',
+  'Land',
+  'Other',
+];
+
+function cardTypeGroup(typeLine: string): string {
+  if (!typeLine) return 'Other';
+  for (const t of TYPE_ORDER.slice(0, -1)) {
+    if (typeLine.includes(t)) return t;
+  }
+  return 'Other';
+}
+
+// ─── List items ────────────────────────────────────────────────────────────
+
+type HeaderItem = { kind: 'header'; title: string; count: number };
+type RowItem    = { kind: 'row';    cards: CollectionCard[] };
+type ListItem   = HeaderItem | RowItem;
+
+function buildListData(cards: CollectionCard[], collapsed: Set<string>): ListItem[] {
+  // Group by type
+  const groups: Record<string, CollectionCard[]> = {};
+  for (const card of cards) {
+    const group = cardTypeGroup(card.type_line);
+    if (!groups[group]) groups[group] = [];
+    groups[group].push(card);
+  }
+
+  const items: ListItem[] = [];
+  for (const type of TYPE_ORDER) {
+    const group = groups[type];
+    if (!group || group.length === 0) continue;
+    items.push({ kind: 'header', title: type, count: group.length });
+    if (collapsed.has(type)) continue;
+    // chunk into rows of 2
+    for (let i = 0; i < group.length; i += 2) {
+      items.push({ kind: 'row', cards: group.slice(i, i + 2) });
+    }
+  }
+  return items;
+}
+
+// ─── Main screen ──────────────────────────────────────────────────────────
+
 export default function CollectionScreen() {
   const { token } = useAuth();
   const router = useRouter();
@@ -49,13 +138,26 @@ export default function CollectionScreen() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
+  // Filters
+  const [search, setSearch] = useState('');
+  const [colorFilter, setColorFilter] = useState<ColorFilter>('all');
+  const [collapsedSections, setCollapsedSections] = useState<Set<string>>(new Set());
+
+  const toggleSection = (title: string) => {
+    setCollapsedSections(prev => {
+      const next = new Set(prev);
+      if (next.has(title)) next.delete(title);
+      else next.add(title);
+      return next;
+    });
+  };
+
   // Card detail modal
   const [selectedCard, setSelectedCard] = useState<CollectionCard | null>(null);
   const [updating, setUpdating] = useState(false);
 
   // Deck picker
   const [decks, setDecks] = useState<Deck[]>([]);
-
   const [loadingDecks, setLoadingDecks] = useState(false);
   const [addingToDeck, setAddingToDeck] = useState(false);
   const [modalView, setModalView] = useState<'card' | 'deck-picker'>('card');
@@ -83,21 +185,32 @@ export default function CollectionScreen() {
     setRefreshing(false);
   }
 
+  // Filtered + grouped list data
+  const listData = useMemo<ListItem[]>(() => {
+    const q = search.trim().toLowerCase();
+    const filtered = cards.filter(card => {
+      const matchesSearch = !q || card.name.toLowerCase().includes(q);
+      return matchesSearch && matchesColor(card, colorFilter);
+    });
+    return buildListData(filtered, collapsedSections);
+  }, [cards, search, colorFilter, collapsedSections]);
+
+  const totalFiltered = useMemo(
+    () => listData.filter(i => i.kind === 'row').reduce((sum, i) => sum + (i as RowItem).cards.length, 0),
+    [listData],
+  );
+
   async function handleQuantityChange(delta: number) {
     if (!selectedCard || updating) return;
 
     const newQuantity = selectedCard.pivot.quantity + delta;
-
-    // Optimistic update
     const updatedCard = { ...selectedCard, pivot: { ...selectedCard.pivot, quantity: newQuantity } };
     setSelectedCard(updatedCard);
     setCards(prev =>
       newQuantity <= 0
         ? prev.filter(c => !(c.id === selectedCard.id && c.pivot.foil === selectedCard.pivot.foil))
         : prev.map(c =>
-            c.id === selectedCard.id && c.pivot.foil === selectedCard.pivot.foil
-              ? updatedCard
-              : c
+            c.id === selectedCard.id && c.pivot.foil === selectedCard.pivot.foil ? updatedCard : c
           )
     );
 
@@ -114,12 +227,8 @@ export default function CollectionScreen() {
       });
 
       if (!response.ok) throw new Error('Update failed');
-
-      if (newQuantity <= 0) {
-        setSelectedCard(null);
-      }
+      if (newQuantity <= 0) setSelectedCard(null);
     } catch {
-      // Revert optimistic update
       setSelectedCard(selectedCard);
       setCards(prev =>
         prev.map(c =>
@@ -138,10 +247,7 @@ export default function CollectionScreen() {
       const response = await fetch(`${API_BASE_URL}/api/decks`, {
         headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
       });
-      if (response.ok) {
-        const data = await response.json();
-        setDecks(data);
-      }
+      if (response.ok) setDecks(await response.json());
     } catch {
       // ignore
     } finally {
@@ -156,7 +262,6 @@ export default function CollectionScreen() {
 
   const addToDeck = async (deckId: number) => {
     if (!selectedCard) return;
-
     setAddingToDeck(true);
     try {
       const response = await fetch(`${API_BASE_URL}/api/decks/${deckId}/cards`, {
@@ -168,7 +273,6 @@ export default function CollectionScreen() {
         },
         body: JSON.stringify({ scryfall_id: selectedCard.scryfall_id, quantity: 1 }),
       });
-
       if (response.ok) {
         setModalView('card');
         setSelectedCard(null);
@@ -193,42 +297,143 @@ export default function CollectionScreen() {
 
   return (
     <View style={styles.container}>
-      <Text style={styles.header}>My Collection</Text>
+      {/* ── Header ── */}
+      <View style={styles.headerRow}>
+        <Text style={styles.header}>My Collection</Text>
+        {cards.length > 0 && (
+          <Text style={styles.headerCount}>
+            {totalFiltered}/{cards.length}
+          </Text>
+        )}
+      </View>
+
+      {/* ── Search bar ── */}
+      {cards.length > 0 && (
+        <View style={styles.searchBar}>
+          <Ionicons name="search" size={16} color="#666" style={styles.searchIcon} />
+          <TextInput
+            style={styles.searchInput}
+            placeholder="Search by name…"
+            placeholderTextColor="#555"
+            value={search}
+            onChangeText={setSearch}
+            returnKeyType="search"
+            clearButtonMode="while-editing"
+            autoCorrect={false}
+          />
+          {search.length > 0 && Platform.OS === 'android' && (
+            <TouchableOpacity onPress={() => setSearch('')} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+              <Ionicons name="close-circle" size={16} color="#666" />
+            </TouchableOpacity>
+          )}
+        </View>
+      )}
+
+      {/* ── Color filter row ── */}
+      {cards.length > 0 && (
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          style={styles.colorFilterScroll}
+          contentContainerStyle={styles.colorFilterRow}
+        >
+          {COLOR_FILTERS.map(cf => {
+            const iconUrl = MANA_ICON_URL[cf.key];
+            return (
+              <TouchableOpacity
+                key={cf.key}
+                style={[
+                  iconUrl ? styles.colorChipIcon : styles.colorChip,
+                  !iconUrl && { backgroundColor: cf.bg, borderColor: cf.border },
+                  colorFilter === cf.key && styles.colorChipActive,
+                ]}
+                onPress={() => setColorFilter(cf.key)}
+                activeOpacity={0.7}
+              >
+                {iconUrl ? (
+                  <SvgUri width={22} height={22} uri={iconUrl} />
+                ) : (
+                  <Text style={[styles.colorChipText, { color: cf.text }]}>{cf.label}</Text>
+                )}
+              </TouchableOpacity>
+            );
+          })}
+        </ScrollView>
+      )}
+
+      {/* ── Card grid ── */}
       <FlatList
-        data={cards}
-        keyExtractor={(item) => `${item.scryfall_id}-${item.pivot.foil}`}
-        numColumns={2}
-        contentContainerStyle={cards.length === 0 ? styles.emptyContent : styles.listContent}
-        columnWrapperStyle={styles.row}
+        data={listData}
+        keyExtractor={(item, index) =>
+          item.kind === 'header' ? `header-${item.title}` : `row-${index}`
+        }
+        contentContainerStyle={listData.length === 0 ? styles.emptyContent : styles.listContent}
         refreshing={refreshing}
         onRefresh={handleRefresh}
         ListEmptyComponent={
-          <View style={styles.emptyState}>
-            <Text style={styles.emptyTitle}>No cards yet</Text>
-            <Text style={styles.emptySubtitle}>Scan your first card to start your collection.</Text>
-            <TouchableOpacity style={styles.scanCta} onPress={() => router.push('/(tabs)/scan')}>
-              <Text style={styles.scanCtaText}>Scan a Card</Text>
-            </TouchableOpacity>
-          </View>
+          cards.length === 0 ? (
+            <View style={styles.emptyState}>
+              <Text style={styles.emptyTitle}>No cards yet</Text>
+              <Text style={styles.emptySubtitle}>Scan your first card to start your collection.</Text>
+              <TouchableOpacity style={styles.scanCta} onPress={() => router.push('/(tabs)/scan')}>
+                <Text style={styles.scanCtaText}>Scan a Card</Text>
+              </TouchableOpacity>
+            </View>
+          ) : (
+            <View style={styles.emptyState}>
+              <Ionicons name="search-outline" size={40} color="#444" />
+              <Text style={styles.emptyTitle}>No matches</Text>
+              <Text style={styles.emptySubtitle}>Try a different name or color filter.</Text>
+            </View>
+          )
         }
-        renderItem={({ item }) => (
-          <TouchableOpacity onPress={() => { setModalView('card'); setSelectedCard(item); }} activeOpacity={0.8}>
-            <CardItem card={item} />
-          </TouchableOpacity>
-        )}
+        renderItem={({ item }) => {
+          if (item.kind === 'header') {
+            const isCollapsed = collapsedSections.has(item.title);
+            return (
+              <TouchableOpacity
+                style={styles.sectionHeader}
+                onPress={() => toggleSection(item.title)}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.sectionHeaderText}>{item.title}</Text>
+                <View style={styles.sectionHeaderRight}>
+                  <Text style={styles.sectionHeaderCount}>{item.count}</Text>
+                  <Ionicons
+                    name={isCollapsed ? 'chevron-forward' : 'chevron-down'}
+                    size={14}
+                    color="#555"
+                  />
+                </View>
+              </TouchableOpacity>
+            );
+          }
+          return (
+            <View style={styles.row}>
+              {item.cards.map(card => (
+                <TouchableOpacity
+                  key={`${card.scryfall_id}-${card.pivot.foil}`}
+                  onPress={() => { setModalView('card'); setSelectedCard(card); }}
+                  activeOpacity={0.8}
+                >
+                  <CardItem card={card} />
+                </TouchableOpacity>
+              ))}
+              {/* spacer when odd card in row */}
+              {item.cards.length === 1 && <View style={{ width: CARD_WIDTH }} />}
+            </View>
+          );
+        }}
       />
 
-      {/* Card Detail / Deck Picker — single modal, view toggled by modalView */}
+      {/* ── Card Detail / Deck Picker modal ── */}
       <Modal
         visible={!!selectedCard}
         animationType="slide"
         transparent={true}
         onRequestClose={() => {
-          if (modalView === 'deck-picker') {
-            setModalView('card');
-          } else {
-            setSelectedCard(null);
-          }
+          if (modalView === 'deck-picker') setModalView('card');
+          else setSelectedCard(null);
         }}
       >
         <View style={styles.modalOverlay}>
@@ -237,10 +442,7 @@ export default function CollectionScreen() {
               <>
                 <View style={styles.modalHeader}>
                   <Text style={styles.modalTitle} numberOfLines={1}>{selectedCard.name}</Text>
-                  <TouchableOpacity
-                    style={styles.closeButton}
-                    onPress={() => setSelectedCard(null)}
-                  >
+                  <TouchableOpacity style={styles.closeButton} onPress={() => setSelectedCard(null)}>
                     <Ionicons name="close" size={24} color="#fff" />
                   </TouchableOpacity>
                 </View>
@@ -383,7 +585,7 @@ function CardItem({ card }: { card: CollectionCard }) {
         <Text style={styles.cardMeta} numberOfLines={1}>{card.set_name}</Text>
         <View style={styles.cardBadges}>
           <View style={styles.quantityBadge}>
-            <Text style={styles.quantityText}>×{card.pivot.quantity}</Text>
+            <Text style={styles.quantityText}>{`\u00D7${card.pivot.quantity}`}</Text>
           </View>
           {card.pivot.foil ? (
             <View style={styles.foilBadge}>
@@ -410,14 +612,124 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+
+  // ── Header ──
+  headerRow: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    paddingHorizontal: 16,
+    paddingTop: 16,
+    paddingBottom: 12,
+    gap: 8,
+  },
   header: {
     color: '#fff',
     fontSize: 22,
     fontWeight: '700',
-    paddingHorizontal: 16,
-    paddingTop: 56,
-    paddingBottom: 12,
   },
+  headerCount: {
+    color: '#666',
+    fontSize: 13,
+    fontWeight: '500',
+  },
+
+  // ── Search ──
+  searchBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#1a1a2e',
+    marginHorizontal: 16,
+    marginBottom: 10,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    height: 40,
+    borderWidth: 1,
+    borderColor: '#2a2a3e',
+  },
+  searchIcon: {
+    marginRight: 8,
+  },
+  searchInput: {
+    flex: 1,
+    color: '#fff',
+    fontSize: 14,
+    paddingVertical: 0,
+  },
+
+  // ── Color filter ──
+  colorFilterScroll: {
+    height: 48,
+    flexGrow: 0,
+    marginBottom: 4,
+  },
+  colorFilterRow: {
+    paddingHorizontal: 16,
+    paddingBottom: 4,
+    gap: 8,
+    alignItems: 'center',
+    height: 48,
+  },
+  colorChip: {
+    height: 32,
+    paddingHorizontal: 12,
+    borderRadius: 16,
+    borderWidth: 2,
+    minWidth: 40,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  colorChipIcon: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: 'transparent',
+    borderWidth: 2,
+    borderColor: 'transparent',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 2,
+  },
+  colorChipActive: {
+    borderColor: '#fff',
+    shadowColor: '#fff',
+    shadowOpacity: 0.4,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 0 },
+    elevation: 6,
+  },
+  colorChipText: {
+    fontSize: 12,
+    fontWeight: '700',
+  },
+
+  // ── Section header ──
+  sectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 4,
+    paddingTop: 8,
+    paddingBottom: 10,
+  },
+  sectionHeaderText: {
+    color: '#aaa',
+    fontSize: 12,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+    letterSpacing: 1.2,
+  },
+  sectionHeaderRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  sectionHeaderCount: {
+    color: '#555',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+
+  // ── List ──
   listContent: {
     paddingHorizontal: 12,
     paddingBottom: 24,
@@ -426,11 +738,12 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   row: {
+    flexDirection: 'row',
     justifyContent: 'space-between',
     marginBottom: 16,
   },
 
-  // Card item
+  // ── Card item ──
   cardItem: {
     width: CARD_WIDTH,
     backgroundColor: '#1a1a2e',
@@ -495,12 +808,13 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
 
-  // Empty state
+  // ── Empty state ──
   emptyState: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 40,
+    gap: 8,
   },
   emptyTitle: {
     color: '#fff',
@@ -526,7 +840,7 @@ const styles = StyleSheet.create({
     fontSize: 15,
   },
 
-  // Modal
+  // ── Modal ──
   modalOverlay: {
     flex: 1,
     backgroundColor: 'rgba(0,0,0,0.85)',
@@ -608,7 +922,7 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
 
-  // Quantity controls
+  // ── Quantity controls ──
   quantitySection: {
     alignItems: 'center',
     marginBottom: 20,
@@ -649,7 +963,7 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
 
-  // Deck button
+  // ── Deck button ──
   deckButton: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -666,33 +980,7 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
 
-  // Deck Picker
-  pickerOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.8)',
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 20,
-  },
-  pickerContent: {
-    backgroundColor: '#1a1a2e',
-    borderRadius: 16,
-    width: '100%',
-    padding: 20,
-    borderWidth: 1,
-    borderColor: '#2a2a3e',
-  },
-  pickerHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 20,
-  },
-  pickerTitle: {
-    color: '#fff',
-    fontSize: 18,
-    fontWeight: '700',
-  },
+  // ── Deck picker ──
   deckSelectItem: {
     flexDirection: 'row',
     alignItems: 'center',
