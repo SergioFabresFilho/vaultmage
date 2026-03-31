@@ -16,7 +16,7 @@ class ScryfallService
      *
      * Uses GET /cards/{code}/{number} for a precise version match.
      *
-     * @return array{scryfall_id:string, name:string, set_code:string, set_name:string, collector_number:string, rarity:string, mana_cost:string|null, type_line:string, image_uri:string|null}
+     * @return array{scryfall_id:string, name:string, set_code:string, set_name:string, collector_number:string, rarity:string, mana_cost:string|null, oracle_text:string|null, cmc:float|int|null, type_line:string, image_uri:string|null}
      *
      * @throws RuntimeException when card is not found
      */
@@ -54,7 +54,7 @@ class ScryfallService
      *
      * Uses GET /cards/{id} for a precise match.
      *
-     * @return array{scryfall_id:string, name:string, set_code:string, set_name:string, collector_number:string, rarity:string, mana_cost:string|null, type_line:string, image_uri:string|null}
+     * @return array{scryfall_id:string, name:string, set_code:string, set_name:string, collector_number:string, rarity:string, mana_cost:string|null, oracle_text:string|null, cmc:float|int|null, type_line:string, image_uri:string|null}
      *
      * @throws RuntimeException when card is not found
      */
@@ -88,7 +88,7 @@ class ScryfallService
     /**
      * Find a card by name (fuzzy) and optional set code.
      *
-     * @return array{scryfall_id:string, name:string, set_code:string, set_name:string, collector_number:string, rarity:string, mana_cost:string|null, type_line:string, image_uri:string|null}
+     * @return array{scryfall_id:string, name:string, set_code:string, set_name:string, collector_number:string, rarity:string, mana_cost:string|null, oracle_text:string|null, cmc:float|int|null, type_line:string, image_uri:string|null}
      *
      * @throws RuntimeException when card is not found
      */
@@ -130,7 +130,7 @@ class ScryfallService
      *
      * Uses GET /cards/search?q=...
      *
-     * @return array<array{scryfall_id:string, name:string, set_code:string, set_name:string, collector_number:string, rarity:string, mana_cost:string|null, type_line:string, image_uri:string|null}>
+     * @return array<array{scryfall_id:string, name:string, set_code:string, set_name:string, collector_number:string, rarity:string, mana_cost:string|null, oracle_text:string|null, cmc:float|int|null, type_line:string, image_uri:string|null}>
      */
     public function search(string $query): array
     {
@@ -170,9 +170,30 @@ class ScryfallService
             'collector_number' => $data['collector_number'],
             'rarity'           => $data['rarity'],
             'mana_cost'        => $data['mana_cost'] ?? null,
+            'oracle_text'      => $this->extractOracleText($data),
+            'cmc'              => $data['cmc'] ?? null,
             'color_identity'   => $data['color_identity'],
+            'legalities'       => $data['legalities'] ?? [],
             'type_line'        => $data['type_line'],
             'image_uri'        => $data['image_uris']['normal'] ?? $data['card_faces'][0]['image_uris']['normal'] ?? null,
         ];
+    }
+
+    private function extractOracleText(array $data): ?string
+    {
+        if (!empty($data['oracle_text'])) {
+            return $data['oracle_text'];
+        }
+
+        if (empty($data['card_faces']) || !is_array($data['card_faces'])) {
+            return null;
+        }
+
+        $faces = array_map(
+            fn (array $face) => trim(($face['name'] ?? 'Face') . ': ' . ($face['oracle_text'] ?? '')),
+            $data['card_faces']
+        );
+
+        return implode("\n\n", array_filter($faces));
     }
 }

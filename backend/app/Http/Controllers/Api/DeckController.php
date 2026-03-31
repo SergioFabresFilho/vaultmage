@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\Deck;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use RuntimeException;
 
 class DeckController extends Controller
 {
@@ -24,7 +25,7 @@ class DeckController extends Controller
     {
         $validated = $request->validate([
             'name' => 'required|string|max:255',
-            'format' => 'nullable|string|in:standard,modern,pioneer,legacy,vintage,commander,brawl,pauper,casual',
+            'format' => 'nullable|string|in:standard,modern,pioneer,legacy,vintage,commander,edh,brawl,pauper,casual',
             'description' => 'nullable|string',
         ]);
 
@@ -58,7 +59,7 @@ class DeckController extends Controller
 
         $validated = $request->validate([
             'name' => 'required|string|max:255',
-            'format' => 'nullable|string|in:standard,modern,pioneer,legacy,vintage,commander,brawl,pauper,casual',
+            'format' => 'nullable|string|in:standard,modern,pioneer,legacy,vintage,commander,edh,brawl,pauper,casual',
             'description' => 'nullable|string',
         ]);
 
@@ -102,7 +103,11 @@ class DeckController extends Controller
         if (!$cardId && !empty($validated['scryfall_id'])) {
             // Find or create card from Scryfall
             $scryfallService = app(\App\Services\ScryfallService::class);
-            $cardData = $scryfallService->findCardById($validated['scryfall_id']);
+            try {
+                $cardData = $scryfallService->findCardById($validated['scryfall_id']);
+            } catch (RuntimeException) {
+                $cardData = null;
+            }
             
             if ($cardData) {
                 $card = \App\Models\Card::updateOrCreate(
@@ -114,7 +119,10 @@ class DeckController extends Controller
                         'collector_number' => $cardData['collector_number'],
                         'rarity' => $cardData['rarity'],
                         'mana_cost' => $cardData['mana_cost'],
+                        'oracle_text' => $cardData['oracle_text'] ?? null,
+                        'cmc' => $cardData['cmc'] ?? null,
                         'color_identity' => $cardData['color_identity'] ?? [],
+                        'legalities' => $cardData['legalities'] ?? [],
                         'type_line' => $cardData['type_line'],
                         'image_uri' => $cardData['image_uri'],
                     ]

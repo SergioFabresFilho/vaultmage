@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\Api\CardController;
+use App\Http\Controllers\Api\ChatController;
 use App\Http\Controllers\Api\CollectionController;
 use App\Http\Controllers\Api\DeckController;
 use App\Http\Controllers\Api\ProfileController;
@@ -18,6 +19,12 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/collection/search', [CollectionController::class, 'search']);
     Route::post('/collection', [CollectionController::class, 'store']);
     Route::patch('/collection/{card}', [CollectionController::class, 'update']);
+
+    Route::get('/chat/conversations', [ChatController::class, 'indexConversations']);
+    Route::post('/chat/conversations', [ChatController::class, 'storeConversation']);
+    Route::get('/chat/conversations/{conversation}', [ChatController::class, 'showConversation']);
+    Route::post('/chat/conversations/{conversation}/messages', [ChatController::class, 'sendMessage']);
+    Route::post('/chat/conversations/{conversation}/create-deck', [ChatController::class, 'createDeck']);
 
     Route::apiResource('decks', DeckController::class);
     Route::post('/decks/{deck}/cards', [DeckController::class, 'addCard']);

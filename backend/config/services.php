@@ -40,4 +40,11 @@ return [
         'project_id' => env('GOOGLE_CLOUD_PROJECT_ID'),
     ],
 
+    'openai' => [
+        'api_key' => env('OPENAI_API_KEY'),
+        'model' => env('OPENAI_MODEL', 'gpt-4.1-mini'),
+        'connect_timeout' => (int) env('OPENAI_CONNECT_TIMEOUT', 5),
+        'timeout' => (int) env('OPENAI_TIMEOUT', 20),
+    ],
+
 ];

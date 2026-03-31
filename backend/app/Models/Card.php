@@ -18,13 +18,18 @@ class Card extends Model
         'collector_number',
         'rarity',
         'mana_cost',
+        'oracle_text',
+        'cmc',
         'color_identity',
+        'legalities',
         'type_line',
         'image_uri',
     ];
 
     protected $casts = [
+        'cmc' => 'float',
         'color_identity' => 'array',
+        'legalities' => 'array',
     ];
 
     public function collectors(): BelongsToMany

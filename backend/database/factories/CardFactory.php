@@ -27,7 +27,10 @@ class CardFactory extends Factory
             'collector_number' => (string) $this->faker->numberBetween(1, 300),
             'rarity'           => $this->faker->randomElement(['common', 'uncommon', 'rare', 'mythic']),
             'mana_cost'        => '{1}{U}',
+            'oracle_text'      => 'Draw a card.',
+            'cmc'              => 2,
             'color_identity'   => ['U'],
+            'legalities'       => ['standard' => 'legal', 'commander' => 'legal', 'brawl' => 'legal'],
             'type_line'        => 'Instant',
             'image_uri'        => $this->faker->imageUrl(),
         ];

@@ -709,9 +709,4 @@ const styles = StyleSheet.create({
     color: '#6C3CE1',
     fontWeight: '600',
   },
-  manaCostContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
 });

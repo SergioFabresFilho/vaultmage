@@ -171,7 +171,7 @@ class DeckTest extends TestCase
         ];
 
         $this->mock(ScryfallService::class, function (MockInterface $mock) use ($scryfallId, $cardData) {
-            $mock->shouldReceive('getCardById')
+            $mock->shouldReceive('findCardById')
                 ->with($scryfallId)
                 ->andReturn($cardData);
         });
@@ -190,7 +190,7 @@ class DeckTest extends TestCase
         $deck = Deck::factory()->create(['user_id' => $this->user->id]);
 
         $this->mock(ScryfallService::class, function (MockInterface $mock) {
-            $mock->shouldReceive('getCardById')->andReturn(null);
+            $mock->shouldReceive('findCardById')->andThrow(new \RuntimeException('Card not found'));
         });
 
         $response = $this->actingAs($this->user)->postJson("/api/decks/{$deck->id}/cards", [

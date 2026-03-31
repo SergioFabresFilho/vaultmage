@@ -2,7 +2,8 @@
   "compilerOptions": {
     "baseUrl": ".",
     "paths": {
-      "@/*": ["./*"]
+      "@/*": ["./*"],
+      "@expo/vector-icons": ["./node_modules/expo/node_modules/@expo/vector-icons"]
     }
   },
   "extends": "expo/tsconfig.base"
