@@ -8,6 +8,7 @@ use App\Models\Deck;
 use App\Models\Message;
 use App\Models\User;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 
 class AiChatService
 {
@@ -275,27 +276,56 @@ class AiChatService
 
     private function toolProposeDeck(array $args, User $user): array
     {
-        $cardIds = collect($args['cards'] ?? [])->pluck('card_id')->unique()->all();
-        $dbCards = Card::whereIn('id', $cardIds)->get()->keyBy('id');
+        $scryfall = app(ScryfallService::class);
+        $entries  = collect($args['cards'] ?? []);
 
-        // Merge owned quantities into the proposal
+        // Resolve each card name to a DB record, fetching from Scryfall if needed
+        $resolvedCards = $entries->map(function ($entry) use ($scryfall) {
+            $name = trim($entry['card_name'] ?? '');
+            if ($name === '') {
+                return null;
+            }
+
+            // 1. Try local DB first (case-insensitive exact match)
+            $card = Card::whereRaw('LOWER(name) = ?', [strtolower($name)])->first();
+
+            if (! $card) {
+                // 2. Fetch from Scryfall and upsert
+                try {
+                    $data = $scryfall->findCard($name);
+                    $card = Card::updateOrCreate(
+                        ['scryfall_id' => $data['scryfall_id']],
+                        $data
+                    );
+                } catch (\Throwable $e) {
+                    Log::warning('AiChatService: could not resolve card from Scryfall', ['name' => $name, 'error' => $e->getMessage()]);
+                    return null;
+                }
+            }
+
+            return ['card' => $card, 'entry' => $entry];
+        })->filter()->values();
+
+        // Build owned quantity map from resolved IDs
+        $resolvedIds = $resolvedCards->pluck('card.id')->all();
         $ownedMap = $user->collection()
             ->withPivot('quantity')
-            ->whereIn('cards.id', $cardIds)
+            ->whereIn('cards.id', $resolvedIds)
             ->get()
             ->keyBy('id')
             ->map(fn ($c) => $c->pivot->quantity);
 
-        $cards = collect($args['cards'] ?? [])->map(function ($entry) use ($dbCards, $ownedMap) {
-            $card = $dbCards[$entry['card_id']] ?? null;
+        $cards = $resolvedCards->map(function ($item) use ($ownedMap) {
+            $card  = $item['card'];
+            $entry = $item['entry'];
             return [
-                'card_id'        => $entry['card_id'],
-                'name'           => $card?->name,
-                'type_line'      => $card?->type_line,
-                'mana_cost'      => $card?->mana_cost,
-                'image_uri'      => $card?->image_uri,
+                'card_id'        => $card->id,
+                'name'           => $card->name,
+                'type_line'      => $card->type_line,
+                'mana_cost'      => $card->mana_cost,
+                'image_uri'      => $card->image_uri,
                 'quantity'       => $entry['quantity'] ?? 1,
-                'owned_quantity' => $ownedMap[$entry['card_id']] ?? 0,
+                'owned_quantity' => $ownedMap[$card->id] ?? 0,
                 'role'           => $entry['role'] ?? null,
                 'reason'         => $entry['reason'] ?? null,
             ];
@@ -400,12 +430,12 @@ class AiChatService
                                 'items' => [
                                     'type'       => 'object',
                                     'properties' => [
-                                        'card_id'  => ['type' => 'integer'],
-                                        'quantity' => ['type' => 'integer', 'minimum' => 1],
-                                        'role'     => ['type' => 'string', 'description' => 'Role in the deck, e.g. commander, ramp, draw, removal, win-con, land.'],
-                                        'reason'   => ['type' => 'string', 'description' => 'Short reason this card is included.'],
+                                        'card_name' => ['type' => 'string', 'description' => 'Exact card name as printed (e.g. "Sol Ring", "Counterspell").'],
+                                        'quantity'  => ['type' => 'integer', 'minimum' => 1],
+                                        'role'      => ['type' => 'string', 'description' => 'Role in the deck, e.g. commander, ramp, draw, removal, win-con, land.'],
+                                        'reason'    => ['type' => 'string', 'description' => 'Short reason this card is included.'],
                                     ],
-                                    'required' => ['card_id', 'quantity'],
+                                    'required' => ['card_name', 'quantity'],
                                 ],
                                 'description' => 'Complete card list for the deck.',
                             ],
