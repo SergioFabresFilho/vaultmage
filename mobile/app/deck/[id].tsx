@@ -136,6 +136,7 @@ export default function DeckViewScreen() {
   const [loading, setLoading] = useState(true);
   const [selectedCard, setSelectedCard] = useState<Card | null>(null);
   const [removing, setRemoving] = useState(false);
+  const [deletingDeck, setDeletingDeck] = useState(false);
 
   const fetchDeck = useCallback(async () => {
     try {
@@ -174,6 +175,37 @@ export default function DeckViewScreen() {
     Alert.alert('Remove Card', `Remove ${card.name} from the deck?`, [
       { text: 'Cancel', style: 'cancel' },
       { text: 'Remove', style: 'destructive', onPress: () => handleRemoveCard(card) },
+    ]);
+  }
+
+  async function handleDeleteDeck() {
+    if (!deck) return;
+
+    setDeletingDeck(true);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/decks/${deck.id}`, {
+        method: 'DELETE',
+        headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
+      });
+
+      if (!res.ok) {
+        throw new Error('Failed to delete deck');
+      }
+
+      router.replace('/decks');
+    } catch {
+      Alert.alert('Error', 'Failed to delete deck.');
+    } finally {
+      setDeletingDeck(false);
+    }
+  }
+
+  function confirmDeleteDeck() {
+    if (!deck || deletingDeck) return;
+
+    Alert.alert('Delete Deck', `Delete ${deck.name}? This cannot be undone.`, [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Delete', style: 'destructive', onPress: handleDeleteDeck },
     ]);
   }
 
@@ -233,6 +265,17 @@ export default function DeckViewScreen() {
             )}
           </View>
         </View>
+        <TouchableOpacity
+          onPress={confirmDeleteDeck}
+          style={[styles.deleteDeckBtn, deletingDeck && styles.buttonDisabled]}
+          disabled={deletingDeck}
+        >
+          {deletingDeck ? (
+            <ActivityIndicator color="#ffb4b4" size="small" />
+          ) : (
+            <Ionicons name="trash-outline" size={20} color="#ff8c8c" />
+          )}
+        </TouchableOpacity>
       </View>
 
       <TouchableOpacity
@@ -394,6 +437,17 @@ const styles = StyleSheet.create({
     marginRight: 14,
   },
   headerInfo: { flex: 1 },
+  deleteDeckBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 12,
+    backgroundColor: '#1a1a2e',
+    borderWidth: 1,
+    borderColor: '#2a2a3e',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginLeft: 12,
+  },
   deckName: { color: '#fff', fontSize: 20, fontWeight: '700' },
   headerMetaRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 2 },
   assistantBtn: {
