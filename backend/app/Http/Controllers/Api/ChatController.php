@@ -18,8 +18,9 @@ class ChatController extends Controller
     public function indexConversations(Request $request): JsonResponse
     {
         $conversations = Conversation::where('user_id', $request->user()->id)
+            ->with('deck:id,name,format')
             ->orderByDesc('updated_at')
-            ->get(['id', 'title', 'created_at', 'updated_at']);
+            ->get(['id', 'deck_id', 'title', 'created_at', 'updated_at']);
 
         return response()->json($conversations);
     }
@@ -27,12 +28,29 @@ class ChatController extends Controller
     // POST /api/chat/conversations
     public function storeConversation(Request $request): JsonResponse
     {
+        $validated = $request->validate([
+            'deck_id' => 'nullable|integer|exists:decks,id',
+        ]);
+
+        $deckId = $validated['deck_id'] ?? null;
+
+        if ($deckId !== null) {
+            $deck = Deck::where('id', $deckId)
+                ->where('user_id', $request->user()->id)
+                ->first();
+
+            if (! $deck) {
+                abort(403);
+            }
+        }
+
         $conversation = Conversation::create([
             'user_id' => $request->user()->id,
+            'deck_id' => $deckId,
             'title'   => null,
         ]);
 
-        return response()->json($conversation, 201);
+        return response()->json($conversation->load('deck:id,name,format'), 201);
     }
 
     // GET /api/chat/conversations/{conversation}
@@ -40,7 +58,7 @@ class ChatController extends Controller
     {
         $this->authorizeConversation($request, $conversation);
 
-        $conversation->load('messages');
+        $conversation->load('messages', 'deck:id,name,format');
 
         return response()->json($conversation);
     }

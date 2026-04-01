@@ -4,6 +4,7 @@ namespace Tests\Feature;
 
 use App\Models\Card;
 use App\Models\Conversation;
+use App\Models\Deck;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
@@ -47,6 +48,22 @@ class AiDeckBuilderTest extends TestCase
             ]);
 
         $response->assertStatus(403);
+    }
+
+    public function test_user_can_create_conversation_attached_to_their_deck(): void
+    {
+        $deck = Deck::factory()->create(['user_id' => $this->user->id]);
+
+        $response = $this->actingAs($this->user)
+            ->postJson('/api/chat/conversations', ['deck_id' => $deck->id]);
+
+        $response->assertCreated();
+        $response->assertJsonPath('deck.id', $deck->id);
+        $this->assertDatabaseHas('conversations', [
+            'id'      => $response->json('id'),
+            'user_id' => $this->user->id,
+            'deck_id' => $deck->id,
+        ]);
     }
 
     // -------------------------------------------------------------------------
@@ -226,6 +243,190 @@ class AiDeckBuilderTest extends TestCase
         // Only one draft saved (the valid one from call_2)
         $this->assertDatabaseCount('decks', 1);
         $this->assertDatabaseHas('decks', ['is_draft' => true]);
+    }
+
+    public function test_existing_deck_context_can_be_loaded_for_upgrade_advice(): void
+    {
+        $ownedUpgrade = $this->makeCard('Arcane Signet', 'Artifact', 1, priceUsd: 1.25);
+        $deckCard = $this->makeCard('Command Tower', 'Land', 0, priceUsd: 0.99);
+
+        $deck = Deck::factory()->create([
+            'user_id' => $this->user->id,
+            'name' => 'Dimir Control',
+            'format' => 'commander',
+            'color_identity' => ['U', 'B'],
+        ]);
+        $deck->cards()->attach($deckCard->id, ['quantity' => 1, 'is_sideboard' => false]);
+
+        $this->conversation->update(['deck_id' => $deck->id]);
+
+        Http::fake([
+            'https://api.openai.com/*' => Http::sequence()
+                ->push($this->toolCallResponse('get_active_deck', [], 'call_1'), 200)
+                ->push($this->toolCallResponse('get_collection', [], 'call_2'), 200)
+                ->push($this->textResponse('Cut weaker ramp and add Arcane Signet from your collection.'), 200),
+        ]);
+
+        $response = $this->actingAs($this->user)
+            ->postJson("/api/chat/conversations/{$this->conversation->id}/messages", [
+                'message' => 'Look at this deck and my collection. What can I change?',
+            ]);
+
+        $response->assertOk();
+        $response->assertJsonPath('message.content', 'Cut weaker ramp and add Arcane Signet from your collection.');
+
+        $toolMessages = $this->conversation->fresh()->messages()->where('role', 'tool')->get();
+        $this->assertCount(2, $toolMessages);
+
+        $activeDeckPayload = json_decode($toolMessages[0]->content, true);
+        $this->assertEquals('Dimir Control', $activeDeckPayload['active_deck']['name']);
+        $this->assertEquals(1, $activeDeckPayload['active_deck']['total_cards']);
+        $this->assertEquals('Command Tower', $activeDeckPayload['active_deck']['cards'][0]['name']);
+
+        $collectionPayload = json_decode($toolMessages[1]->content, true);
+        $this->assertEquals($ownedUpgrade->name, $collectionPayload['cards'][0]['name']);
+    }
+
+    public function test_deck_upgrade_proposal_returns_added_and_removed_cards(): void
+    {
+        $cut = $this->makeCard('Cancel', 'Instant', 0, priceUsd: 0.10);
+        $keep = $this->makeCard('Island', 'Basic Land — Island', 10, priceUsd: 0.02);
+        $add = $this->makeCard('Counterspell', 'Instant', 2, priceUsd: 1.50);
+
+        $deck = Deck::factory()->create([
+            'user_id' => $this->user->id,
+            'name' => 'Blue Control',
+            'format' => 'casual',
+        ]);
+        $deck->cards()->attach($cut->id, ['quantity' => 2, 'is_sideboard' => false]);
+        $deck->cards()->attach($keep->id, ['quantity' => 20, 'is_sideboard' => false]);
+
+        $this->conversation->update(['deck_id' => $deck->id]);
+
+        Http::fake([
+            'https://api.openai.com/*' => Http::sequence()
+                ->push($this->toolCallResponse('propose_changes', [
+                    'deck_name' => 'Blue Control',
+                    'format' => 'casual',
+                    'strategy_summary' => 'Upgrade the interaction suite.',
+                    'added_cards' => [
+                        ['card_name' => 'Counterspell', 'quantity' => 2, 'role' => 'interaction'],
+                    ],
+                    'removed_cards' => [
+                        ['card_name' => 'Cancel', 'quantity' => 2, 'role' => 'interaction'],
+                    ],
+                ], 'call_1'), 200)
+                ->push($this->textResponse('Swap Cancel for Counterspell.'), 200),
+        ]);
+
+        $response = $this->actingAs($this->user)
+            ->postJson("/api/chat/conversations/{$this->conversation->id}/messages", [
+                'message' => 'Improve this deck.',
+            ]);
+
+        $response->assertOk();
+        $proposal = $response->json('deck_proposal');
+        $this->assertNotNull($proposal);
+        $this->assertEquals('changes', $proposal['proposal_type']);
+        $this->assertCount(1, $proposal['added_cards']);
+        $this->assertCount(1, $proposal['removed_cards']);
+        $this->assertNull($proposal['draft_deck_id'] ?? null);
+        $this->assertEquals('Counterspell', $proposal['added_cards'][0]['name']);
+        $this->assertEquals(2, $proposal['added_cards'][0]['quantity']);
+        $this->assertEquals('Cancel', $proposal['removed_cards'][0]['name']);
+        $this->assertEquals(2, $proposal['removed_cards'][0]['quantity']);
+    }
+
+    public function test_deck_upgrade_proposal_retries_when_change_cards_are_unresolved(): void
+    {
+        $cut = $this->makeCard('Cancel', 'Instant', 0, priceUsd: 0.10);
+        $add = $this->makeCard('Counterspell', 'Instant', 2, priceUsd: 1.50);
+
+        $deck = Deck::factory()->create([
+            'user_id' => $this->user->id,
+            'name' => 'Blue Control',
+            'format' => 'casual',
+        ]);
+        $deck->cards()->attach($cut->id, ['quantity' => 2, 'is_sideboard' => false]);
+
+        $this->conversation->update(['deck_id' => $deck->id]);
+
+        Http::fake([
+            'https://api.openai.com/*' => Http::sequence()
+                ->push($this->toolCallResponse('propose_changes', [
+                    'deck_name' => 'Blue Control',
+                    'format' => 'casual',
+                    'strategy_summary' => 'Upgrade the interaction suite.',
+                    'added_cards' => [
+                        ['card_name' => 'Counter magic', 'quantity' => 2, 'role' => 'interaction'],
+                    ],
+                    'removed_cards' => [
+                        ['card_name' => 'Cancel', 'quantity' => 2, 'role' => 'interaction'],
+                    ],
+                ], 'call_1'), 200)
+                ->push($this->toolCallResponse('propose_changes', [
+                    'deck_name' => 'Blue Control',
+                    'format' => 'casual',
+                    'strategy_summary' => 'Upgrade the interaction suite.',
+                    'added_cards' => [
+                        ['card_name' => 'Counterspell', 'quantity' => 2, 'role' => 'interaction'],
+                    ],
+                    'removed_cards' => [
+                        ['card_name' => 'Cancel', 'quantity' => 2, 'role' => 'interaction'],
+                    ],
+                ], 'call_2'), 200)
+                ->push($this->textResponse('Swap Cancel for Counterspell.'), 200),
+        ]);
+
+        $response = $this->actingAs($this->user)
+            ->postJson("/api/chat/conversations/{$this->conversation->id}/messages", [
+                'message' => 'Improve this deck.',
+            ]);
+
+        $response->assertOk();
+        $proposal = $response->json('deck_proposal');
+        $this->assertNotNull($proposal);
+        $this->assertCount(1, $proposal['added_cards']);
+        $this->assertEquals('Counterspell', $proposal['added_cards'][0]['name']);
+
+        $toolMessages = $this->conversation->messages()->where('role', 'tool')->get();
+        $this->assertCount(2, $toolMessages);
+        $this->assertStringContainsString(
+            'Change proposal rejected',
+            $toolMessages->first()->content
+        );
+    }
+
+    public function test_deck_improvement_conversation_hits_lower_tool_round_cap(): void
+    {
+        $deck = Deck::factory()->create([
+            'user_id' => $this->user->id,
+            'name' => 'Slow Loop Deck',
+            'format' => 'commander',
+        ]);
+        $this->conversation->update(['deck_id' => $deck->id]);
+
+        Http::fake([
+            'https://api.openai.com/*' => Http::sequence()
+                ->push($this->toolCallResponse('get_active_deck', [], 'call_1'), 200)
+                ->push($this->toolCallResponse('get_active_deck', [], 'call_2'), 200)
+                ->push($this->toolCallResponse('get_active_deck', [], 'call_3'), 200)
+                ->push($this->toolCallResponse('get_active_deck', [], 'call_4'), 200)
+                ->push($this->toolCallResponse('get_active_deck', [], 'call_5'), 200)
+                ->push($this->toolCallResponse('get_active_deck', [], 'call_6'), 200)
+                ->push($this->toolCallResponse('get_active_deck', [], 'call_7'), 200),
+        ]);
+
+        $response = $this->actingAs($this->user)
+            ->postJson("/api/chat/conversations/{$this->conversation->id}/messages", [
+                'message' => 'Keep improving this deck forever.',
+            ]);
+
+        $response->assertStatus(502);
+        $this->assertStringContainsString(
+            'maximum number of tool-call rounds (6)',
+            $response->json('message')
+        );
     }
 
     // -------------------------------------------------------------------------

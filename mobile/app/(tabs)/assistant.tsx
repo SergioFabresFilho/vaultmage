@@ -15,6 +15,7 @@ import {
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useAuth } from '@/context/AuthContext';
 
 const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:8000';
@@ -25,6 +26,12 @@ const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:8
 
 type Conversation = {
   id: number;
+  deck_id: number | null;
+  deck?: {
+    id: number;
+    name: string;
+    format: string | null;
+  } | null;
   title: string | null;
   updated_at: string;
 };
@@ -42,10 +49,14 @@ type ProposalCard = {
 };
 
 type DeckProposal = {
+  proposal_type?: 'deck' | 'changes';
   deck_name: string;
   format: string | null;
   strategy_summary: string | null;
   cards: ProposalCard[];
+  added_cards?: ProposalCard[];
+  removed_cards?: ProposalCard[];
+  buy_cards?: ProposalCard[];
   draft_deck_id?: number | null;
 };
 
@@ -91,7 +102,54 @@ function ProposalBubble({
   onCardPress: (card: ProposalCard) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const visible = expanded ? proposal.cards : proposal.cards.slice(0, 6);
+  const addedCards = proposal.added_cards ?? [];
+  const removedCards = proposal.removed_cards ?? [];
+  const buyCards = proposal.buy_cards ?? [];
+  const isChangeProposal = proposal.proposal_type === 'changes';
+  const hasDiffView = isChangeProposal || addedCards.length > 0 || removedCards.length > 0 || buyCards.length > 0;
+  const visibleCards = expanded ? proposal.cards : proposal.cards.slice(0, 6);
+
+  function renderCardRow(card: ProposalCard, kind: 'default' | 'added' | 'removed' = 'default') {
+    return (
+      <TouchableOpacity
+        key={`${kind}-${card.card_id != null ? String(card.card_id) : card.name}`}
+        style={styles.proposalCardRow}
+        onPress={() => onCardPress(card)}
+        activeOpacity={0.7}
+      >
+        {card.image_uri ? (
+          <Image source={{ uri: card.image_uri }} style={styles.proposalCardThumb} resizeMode="cover" />
+        ) : (
+          <View style={[styles.proposalCardThumb, styles.proposalCardThumbPlaceholder]}>
+            <Ionicons name="image-outline" size={14} color="#444" />
+          </View>
+        )}
+        <View style={styles.proposalCardLeft}>
+          <Text style={styles.proposalCardName}>{card.name ?? `Card #${card.card_id}`}</Text>
+          <Text style={styles.proposalCardMeta}>
+            {card.type_line ?? ''}
+            {card.mana_cost ? `  ${card.mana_cost}` : ''}
+          </Text>
+          {card.reason ? <Text style={styles.proposalCardReason}>{card.reason}</Text> : null}
+        </View>
+        <View style={styles.proposalCardRight}>
+          <Text
+            style={[
+              styles.proposalCardQty,
+              kind === 'added' ? styles.deltaAddedText : null,
+              kind === 'removed' ? styles.deltaRemovedText : null,
+            ]}
+          >
+            {kind === 'added' ? '+' : kind === 'removed' ? '-' : '×'}
+            {card.quantity}
+          </Text>
+          <Text style={[styles.proposalCardOwned, card.owned_quantity > 0 ? styles.ownedYes : styles.ownedNo]}>
+            {card.owned_quantity > 0 ? `own ${card.owned_quantity}` : 'not owned'}
+          </Text>
+        </View>
+      </TouchableOpacity>
+    );
+  }
 
   return (
     <View style={styles.proposalCard}>
@@ -106,38 +164,41 @@ function ProposalBubble({
 
       <View style={styles.proposalDivider} />
 
-      {visible.map((card) => (
-        <TouchableOpacity
-          key={card.card_id != null ? String(card.card_id) : card.name}
-          style={styles.proposalCardRow}
-          onPress={() => onCardPress(card)}
-          activeOpacity={0.7}
-        >
-          {card.image_uri ? (
-            <Image source={{ uri: card.image_uri }} style={styles.proposalCardThumb} resizeMode="cover" />
-          ) : (
-            <View style={[styles.proposalCardThumb, styles.proposalCardThumbPlaceholder]}>
-              <Ionicons name="image-outline" size={14} color="#444" />
+      {hasDiffView ? (
+        <>
+          {addedCards.length > 0 ? (
+            <View style={styles.changeSection}>
+              <View style={styles.changeSectionHeader}>
+                <Ionicons name="add-circle" size={16} color="#4ade80" />
+                <Text style={styles.changeSectionTitle}>Added</Text>
+              </View>
+              {addedCards.map((card) => renderCardRow(card, 'added'))}
             </View>
-          )}
-          <View style={styles.proposalCardLeft}>
-            <Text style={styles.proposalCardName}>{card.name ?? `Card #${card.card_id}`}</Text>
-            <Text style={styles.proposalCardMeta}>
-              {card.type_line ?? ''}
-              {card.mana_cost ? `  ${card.mana_cost}` : ''}
-            </Text>
-            {card.reason ? <Text style={styles.proposalCardReason}>{card.reason}</Text> : null}
-          </View>
-          <View style={styles.proposalCardRight}>
-            <Text style={styles.proposalCardQty}>×{card.quantity}</Text>
-            <Text style={[styles.proposalCardOwned, card.owned_quantity > 0 ? styles.ownedYes : styles.ownedNo]}>
-              {card.owned_quantity > 0 ? `own ${card.owned_quantity}` : 'not owned'}
-            </Text>
-          </View>
-        </TouchableOpacity>
-      ))}
+          ) : null}
+          {removedCards.length > 0 ? (
+            <View style={styles.changeSection}>
+              <View style={styles.changeSectionHeader}>
+                <Ionicons name="remove-circle" size={16} color="#f87171" />
+                <Text style={styles.changeSectionTitle}>Removed</Text>
+              </View>
+              {removedCards.map((card) => renderCardRow(card, 'removed'))}
+            </View>
+          ) : null}
+          {buyCards.length > 0 ? (
+            <View style={styles.changeSection}>
+              <View style={styles.changeSectionHeader}>
+                <Ionicons name="cart" size={16} color="#60a5fa" />
+                <Text style={styles.changeSectionTitle}>Worth Buying</Text>
+              </View>
+              {buyCards.map((card) => renderCardRow(card, 'added'))}
+            </View>
+          ) : null}
+        </>
+      ) : (
+        visibleCards.map((card) => renderCardRow(card))
+      )}
 
-      {proposal.cards.length > 6 ? (
+      {!hasDiffView && proposal.cards.length > 6 ? (
         <TouchableOpacity onPress={() => setExpanded((v) => !v)} style={styles.showMoreBtn}>
           <Text style={styles.showMoreText}>
             {expanded ? 'Show less' : `Show all ${proposal.cards.length} cards`}
@@ -145,7 +206,7 @@ function ProposalBubble({
         </TouchableOpacity>
       ) : null}
 
-      {proposal.draft_deck_id != null ? (
+      {isChangeProposal ? null : proposal.draft_deck_id != null ? (
         <View style={styles.draftActionRow}>
           <TouchableOpacity
             style={[styles.validateDeckBtn, creating && styles.buttonDisabled]}
@@ -243,6 +304,8 @@ function MessageBubble({
 
 export default function AssistantScreen() {
   const { token } = useAuth();
+  const router = useRouter();
+  const params = useLocalSearchParams<{ deckId?: string; deckName?: string }>();
 
   // Conversation list view
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -267,6 +330,7 @@ export default function AssistantScreen() {
   const [selectedProposalCard, setSelectedProposalCard] = useState<ProposalCard | null>(null);
 
   const flatListRef = useRef<FlatList>(null);
+  const handledDeckParamRef = useRef<string | null>(null);
 
   // -------------------------------------------------------------------------
   // Fetch conversations
@@ -303,6 +367,7 @@ export default function AssistantScreen() {
       });
       if (!res.ok) throw new Error('Failed to load messages');
       const data = await res.json();
+      setActiveConversation(data);
       setMessages(data.messages ?? []);
     } catch {
       Alert.alert('Error', 'Could not load conversation.');
@@ -311,11 +376,16 @@ export default function AssistantScreen() {
     }
   }
 
-  async function startNewConversation() {
+  async function startNewConversation(deckId?: number | null) {
     try {
       const res = await fetch(`${API_BASE_URL}/api/chat/conversations`, {
         method: 'POST',
-        headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ deck_id: deckId ?? null }),
       });
       if (!res.ok) throw new Error();
       const conv: Conversation = await res.json();
@@ -326,6 +396,18 @@ export default function AssistantScreen() {
       Alert.alert('Error', 'Could not start a new conversation.');
     }
   }
+
+  useEffect(() => {
+    const rawDeckId = params.deckId;
+    if (!rawDeckId || activeConversation) return;
+    if (handledDeckParamRef.current === rawDeckId) return;
+
+    const parsedDeckId = Number(rawDeckId);
+    if (!Number.isFinite(parsedDeckId)) return;
+
+    handledDeckParamRef.current = rawDeckId;
+    startNewConversation(parsedDeckId);
+  }, [activeConversation, params.deckId]);
 
   // -------------------------------------------------------------------------
   // Send message
@@ -376,6 +458,7 @@ export default function AssistantScreen() {
         get_decks:       'Loading your decks…',
         search_cards:    'Searching cards…',
         search_scryfall: 'Looking up Scryfall…',
+        propose_changes: 'Preparing upgrade suggestions…',
         propose_deck:    'Building deck proposal…',
       };
 
@@ -571,7 +654,7 @@ export default function AssistantScreen() {
       <View style={styles.container}>
         <View style={styles.headerRow}>
           <Text style={styles.header}>AI Assistant</Text>
-          <TouchableOpacity style={styles.newChatBtn} onPress={startNewConversation}>
+          <TouchableOpacity style={styles.newChatBtn} onPress={() => startNewConversation()}>
             <Ionicons name="add" size={20} color="#fff" />
             <Text style={styles.newChatBtnText}>New Chat</Text>
           </TouchableOpacity>
@@ -586,9 +669,11 @@ export default function AssistantScreen() {
             <Ionicons name="chatbubbles-outline" size={64} color="#433647" />
             <Text style={styles.emptyTitle}>No conversations yet</Text>
             <Text style={styles.emptySubtitle}>
-              Tell VaultMage what kind of deck you want to build. It knows your collection.
+              {params.deckName
+                ? `Start a chat about ${params.deckName}. VaultMage will use that deck and your collection.`
+                : 'Tell VaultMage what kind of deck you want to build. It knows your collection.'}
             </Text>
-            <TouchableOpacity style={styles.primaryCta} onPress={startNewConversation}>
+            <TouchableOpacity style={styles.primaryCta} onPress={() => startNewConversation()}>
               <Text style={styles.primaryCtaText}>Start Building</Text>
             </TouchableOpacity>
           </View>
@@ -637,10 +722,24 @@ export default function AssistantScreen() {
         <Text style={styles.chatHeaderTitle} numberOfLines={1}>
           {activeConversation.title ?? 'New conversation'}
         </Text>
-        <TouchableOpacity style={styles.newChatIconBtn} onPress={startNewConversation}>
+        <TouchableOpacity style={styles.newChatIconBtn} onPress={() => startNewConversation()}>
           <Ionicons name="add-circle-outline" size={24} color="#6C3CE1" />
         </TouchableOpacity>
       </View>
+
+      {activeConversation.deck ? (
+        <TouchableOpacity
+          style={styles.activeDeckBanner}
+          onPress={() => router.push(`/deck/${activeConversation.deck!.id}`)}
+          activeOpacity={0.8}
+        >
+          <Ionicons name="albums" size={16} color="#ffb36b" />
+          <Text style={styles.activeDeckBannerText} numberOfLines={1}>
+            Deck context: {activeConversation.deck.name}
+            {activeConversation.deck.format ? ` • ${activeConversation.deck.format}` : ''}
+          </Text>
+        </TouchableOpacity>
+      ) : null}
 
       {/* Messages */}
       {loadingMessages ? (
@@ -657,7 +756,9 @@ export default function AssistantScreen() {
             <View style={styles.emptyChat}>
               <Ionicons name="sparkles" size={32} color="#6C3CE1" style={{ marginBottom: 12 }} />
               <Text style={styles.emptyChatText}>
-                Tell me what kind of deck you want to build. I'll check your collection and craft something great.
+                {activeConversation.deck
+                  ? `Ask how to improve ${activeConversation.deck.name}, what to swap from your collection, or what to buy next.`
+                  : "Tell me what kind of deck you want to build. I'll check your collection and craft something great."}
               </Text>
             </View>
           }
@@ -870,6 +971,26 @@ const styles = StyleSheet.create({
   backBtn: { padding: 6, marginRight: 4 },
   chatHeaderTitle: { flex: 1, color: '#fff', fontSize: 16, fontWeight: '600' },
   newChatIconBtn: { padding: 6 },
+  activeDeckBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginHorizontal: 16,
+    marginTop: 12,
+    marginBottom: 4,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: '#171722',
+    borderWidth: 1,
+    borderColor: '#2a2a3e',
+  },
+  activeDeckBannerText: {
+    flex: 1,
+    color: '#f4e8dc',
+    fontSize: 13,
+    fontWeight: '600',
+  },
 
   // Messages
   messagesContent: { paddingHorizontal: 16, paddingVertical: 16, paddingBottom: 8 },
@@ -1036,6 +1157,20 @@ const styles = StyleSheet.create({
   proposalMeta: { color: '#6C3CE1', fontSize: 11, fontWeight: '700', marginBottom: 6, letterSpacing: 0.6 },
   proposalStrategy: { color: '#888', fontSize: 13, lineHeight: 18, marginBottom: 8 },
   proposalDivider: { height: 1, backgroundColor: '#2a2a3e', marginBottom: 10 },
+  changeSection: { marginBottom: 10 },
+  changeSectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginBottom: 8,
+  },
+  changeSectionTitle: {
+    color: '#f1e6dc',
+    fontSize: 13,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+    letterSpacing: 0.4,
+  },
   proposalCardRow: {
     flexDirection: 'row',
     alignItems: 'flex-start',
@@ -1049,6 +1184,8 @@ const styles = StyleSheet.create({
   proposalCardReason: { color: '#888', fontSize: 12, lineHeight: 16, fontStyle: 'italic' },
   proposalCardRight: { alignItems: 'flex-end', marginLeft: 10 },
   proposalCardQty: { color: '#fff', fontSize: 15, fontWeight: '700' },
+  deltaAddedText: { color: '#4ade80' },
+  deltaRemovedText: { color: '#f87171' },
   proposalCardOwned: { fontSize: 11, marginTop: 2 },
   ownedYes: { color: '#4ade80' },
   ownedNo: { color: '#f87171' },

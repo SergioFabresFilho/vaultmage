@@ -14,7 +14,8 @@ use Illuminate\Support\Facades\Log;
 
 class AiChatService
 {
-    private const MAX_TOOL_ROUNDS = 50;
+    private const MAX_TOOL_ROUNDS_BUILD = 10;
+    private const MAX_TOOL_ROUNDS_IMPROVEMENT = 6;
 
     private string $apiKey;
     private string $model;
@@ -56,6 +57,7 @@ class AiChatService
         $history  = $this->buildHistory($conversation);
         $tools    = $this->toolDefinitions();
         $proposal = null;
+        $maxToolRounds = $this->maxToolRoundsForConversation($conversation);
 
         $toolRounds = 0;
 
@@ -82,12 +84,13 @@ class AiChatService
                 return ['message' => $assistantMsg, 'deck_proposal' => $proposal];
             }
 
-            if ($toolRounds >= self::MAX_TOOL_ROUNDS) {
+            if ($toolRounds >= $maxToolRounds) {
                 Log::warning('AiChatService: MAX_TOOL_ROUNDS reached', [
                     'conversation_id' => $conversation->id,
                     'rounds'          => $toolRounds,
+                    'max_rounds'      => $maxToolRounds,
                 ]);
-                abort(502, 'AI exceeded the maximum number of tool-call rounds.');
+                abort(502, "AI exceeded the maximum number of tool-call rounds ({$maxToolRounds}).");
             }
 
             $toolRounds++;
@@ -123,13 +126,20 @@ class AiChatService
 
                 $result = $this->executeTool($call, $user, $conversation);
 
-                // If propose_deck was called, capture the proposal
-                if ($fnName === 'propose_deck' && isset($result['proposal'])) {
+                if (in_array($fnName, ['propose_deck', 'propose_changes'], true) && isset($result['proposal'])) {
                     $proposal = $result['proposal'];
-                    $toolOutput = json_encode(['status' => 'proposal_saved', 'card_count' => count($proposal['cards'])]);
-                    Log::debug('AiChatService: propose_deck result', [
+                    $toolOutput = json_encode([
+                        'status' => 'proposal_saved',
+                        'proposal_type' => $proposal['proposal_type'] ?? 'deck',
+                        'card_count' => count($proposal['cards'] ?? []),
+                        'added_count' => count($proposal['added_cards'] ?? []),
+                        'removed_count' => count($proposal['removed_cards'] ?? []),
+                    ]);
+                    Log::debug("AiChatService: {$fnName} result", [
                         'conversation_id' => $conversation->id,
-                        'card_count'      => count($proposal['cards']),
+                        'card_count'      => count($proposal['cards'] ?? []),
+                        'added_count'     => count($proposal['added_cards'] ?? []),
+                        'removed_count'   => count($proposal['removed_cards'] ?? []),
                     ]);
                 } else {
                     $toolOutput = json_encode($result);
@@ -182,6 +192,7 @@ class AiChatService
         $history  = $this->buildHistory($conversation);
         $tools    = $this->toolDefinitions();
         $proposal = null;
+        $maxToolRounds = $this->maxToolRoundsForConversation($conversation);
 
         $toolRounds = 0;
 
@@ -207,12 +218,13 @@ class AiChatService
                 return;
             }
 
-            if ($toolRounds >= self::MAX_TOOL_ROUNDS) {
+            if ($toolRounds >= $maxToolRounds) {
                 Log::warning('AiChatService: MAX_TOOL_ROUNDS reached (stream)', [
                     'conversation_id' => $conversation->id,
                     'rounds'          => $toolRounds,
+                    'max_rounds'      => $maxToolRounds,
                 ]);
-                $emit('error', 'AI exceeded the maximum number of tool-call rounds.');
+                $emit('error', "AI exceeded the maximum number of tool-call rounds ({$maxToolRounds}).");
                 return;
             }
 
@@ -249,12 +261,20 @@ class AiChatService
 
                 $result = $this->executeTool($call, $user, $conversation);
 
-                if ($fnName === 'propose_deck' && isset($result['proposal'])) {
+                if (in_array($fnName, ['propose_deck', 'propose_changes'], true) && isset($result['proposal'])) {
                     $proposal    = $result['proposal'];
-                    $toolOutput  = json_encode(['status' => 'proposal_saved', 'card_count' => count($proposal['cards'])]);
-                    Log::debug('AiChatService: propose_deck result (stream)', [
+                    $toolOutput  = json_encode([
+                        'status' => 'proposal_saved',
+                        'proposal_type' => $proposal['proposal_type'] ?? 'deck',
+                        'card_count' => count($proposal['cards'] ?? []),
+                        'added_count' => count($proposal['added_cards'] ?? []),
+                        'removed_count' => count($proposal['removed_cards'] ?? []),
+                    ]);
+                    Log::debug("AiChatService: {$fnName} result (stream)", [
                         'conversation_id' => $conversation->id,
-                        'card_count'      => count($proposal['cards']),
+                        'card_count'      => count($proposal['cards'] ?? []),
+                        'added_count'     => count($proposal['added_cards'] ?? []),
+                        'removed_count'   => count($proposal['removed_cards'] ?? []),
                     ]);
                 } else {
                     $toolOutput = json_encode($result);
@@ -405,7 +425,7 @@ class AiChatService
     {
         $history = [[
             'role'    => 'system',
-            'content' => $this->systemPrompt(),
+            'content' => $this->systemPrompt($conversation),
         ]];
 
         foreach ($conversation->messages as $msg) {
@@ -429,6 +449,13 @@ class AiChatService
         return $history;
     }
 
+    private function maxToolRoundsForConversation(Conversation $conversation): int
+    {
+        return $conversation->deck_id
+            ? self::MAX_TOOL_ROUNDS_IMPROVEMENT
+            : self::MAX_TOOL_ROUNDS_BUILD;
+    }
+
     // -------------------------------------------------------------------------
     // Tool execution
     // -------------------------------------------------------------------------
@@ -441,10 +468,12 @@ class AiChatService
         return match ($name) {
             'get_collection'       => $this->toolGetCollection($user, $args),
             'get_decks'            => $this->toolGetDecks($user),
+            'get_active_deck'      => $this->toolGetActiveDeck($conversation, $user),
             'search_cards'         => $this->toolSearchCards($args),
             'search_scryfall'      => $this->toolSearchScryfall($args),
             'get_commander_guide'  => $this->toolGetCommanderGuide($args),
-            'propose_deck'         => $this->toolProposeDeck($args, $user),
+            'propose_deck'         => $this->toolProposeDeck($args, $user, $conversation),
+            'propose_changes'      => $this->toolProposeChanges($args, $user, $conversation),
             default                => ['error' => "Unknown tool: {$name}"],
         };
     }
@@ -498,6 +527,67 @@ class AiChatService
             ]);
 
         return ['decks' => $decks->values()->all()];
+    }
+
+    private function toolGetActiveDeck(Conversation $conversation, User $user): array
+    {
+        if (! $conversation->deck_id) {
+            return ['active_deck' => null, 'message' => 'No active deck is attached to this conversation.'];
+        }
+
+        $deck = Deck::where('user_id', $user->id)
+            ->with(['cards' => function ($query) {
+                $query->select(
+                    'cards.id',
+                    'cards.name',
+                    'cards.type_line',
+                    'cards.mana_cost',
+                    'cards.oracle_text',
+                    'cards.cmc',
+                    'cards.color_identity',
+                    'cards.price_usd'
+                );
+            }])
+            ->find($conversation->deck_id);
+
+        if (! $deck) {
+            return ['active_deck' => null, 'message' => 'The attached deck could not be found.'];
+        }
+
+        $collectionQty = $user->collection()
+            ->pluck('collection_cards.quantity', 'cards.id');
+
+        $cards = $deck->cards->map(function ($card) use ($collectionQty) {
+            $owned = (int) ($collectionQty[$card->id] ?? 0);
+            $required = (int) $card->pivot->quantity;
+
+            return [
+                'id'               => $card->id,
+                'name'             => $card->name,
+                'type_line'        => $card->type_line,
+                'mana_cost'        => $card->mana_cost,
+                'cmc'              => $card->cmc,
+                'color_identity'   => $card->color_identity,
+                'oracle_text'      => $card->oracle_text ? mb_substr($card->oracle_text, 0, 160) : null,
+                'price_usd'        => $card->price_usd,
+                'quantity'         => $required,
+                'quantity_owned'   => $owned,
+                'quantity_missing' => max(0, $required - $owned),
+                'is_sideboard'     => (bool) $card->pivot->is_sideboard,
+            ];
+        });
+
+        return [
+            'active_deck' => [
+                'id'             => $deck->id,
+                'name'           => $deck->name,
+                'format'         => $deck->format,
+                'description'    => $deck->description,
+                'color_identity' => $deck->color_identity,
+                'total_cards'    => $cards->sum('quantity'),
+                'cards'          => $cards->values()->all(),
+            ],
+        ];
     }
 
     private function toolSearchCards(array $args): array
@@ -601,7 +691,7 @@ class AiChatService
         ];
     }
 
-    private function toolProposeDeck(array $args, User $user): array
+    private function toolProposeDeck(array $args, User $user, Conversation $conversation): array
     {
         $scryfall = app(ScryfallService::class);
         $entries  = collect($args['cards'] ?? []);
@@ -820,14 +910,212 @@ class AiChatService
             'cards'    => count($cards),
         ]);
 
+        $changes = $this->buildProposalChanges($conversation, $cards, $user);
+
         return [
             'proposal' => [
+                'proposal_type'     => 'deck',
                 'deck_name'        => $args['deck_name'] ?? 'New Deck',
                 'format'           => $args['format'] ?? null,
                 'strategy_summary' => $args['strategy_summary'] ?? null,
                 'cards'            => $cards,
+                'added_cards'      => $changes['added_cards'],
+                'removed_cards'    => $changes['removed_cards'],
                 'draft_deck_id'    => $draft->id,
             ],
+        ];
+    }
+
+    private function toolProposeChanges(array $args, User $user, Conversation $conversation): array
+    {
+        if (! $conversation->deck_id) {
+            return ['error' => 'propose_changes requires an active deck attached to the conversation.'];
+        }
+
+        $added = $this->resolveChangeEntries($args['added_cards'] ?? [], $user);
+        $removed = $this->resolveChangeEntries($args['removed_cards'] ?? [], $user);
+        $buy = $this->resolveChangeEntries($args['buy_cards'] ?? [], $user);
+
+        $unresolvedNames = array_values(array_unique(array_merge(
+            $added['unresolved_names'],
+            $removed['unresolved_names'],
+            $buy['unresolved_names'],
+        )));
+
+        if ($unresolvedNames !== []) {
+            $list = implode(', ', array_map(fn (string $name) => "\"{$name}\"", $unresolvedNames));
+
+            return ['error' => "Change proposal rejected: every added, removed, or buy recommendation must use a real, exact card name. Unresolved entries: {$list}. Replace them with exact printed card names and call propose_changes again."];
+        }
+
+        if ($added['cards'] === [] && $removed['cards'] === [] && $buy['cards'] === []) {
+            return ['error' => 'Change proposal rejected: no valid added_cards, removed_cards, or buy_cards were provided. Include at least one concrete card change and call propose_changes again.'];
+        }
+
+        return [
+            'proposal' => [
+                'proposal_type'     => 'changes',
+                'deck_name'         => $args['deck_name'] ?? 'Deck Improvements',
+                'format'            => $args['format'] ?? null,
+                'strategy_summary'  => $args['strategy_summary'] ?? null,
+                'cards'             => [],
+                'added_cards'       => $added['cards'],
+                'removed_cards'     => $removed['cards'],
+                'buy_cards'         => $buy['cards'],
+            ],
+        ];
+    }
+
+    private function resolveChangeEntries(array $entries, User $user): array
+    {
+        $resolution = $this->resolveEntriesWithCards($entries);
+        $resolved = $resolution['resolved'];
+        $resolvedIds = $resolved->pluck('card.id')->all();
+
+        $ownedMap = $user->collection()
+            ->withPivot('quantity')
+            ->whereIn('cards.id', $resolvedIds)
+            ->get()
+            ->keyBy('id')
+            ->map(fn ($c) => $c->pivot->quantity);
+
+        return [
+            'cards' => $resolved->map(function ($item) use ($ownedMap) {
+            $card = $item['card'];
+            $entry = $item['entry'];
+
+            return [
+                'card_id'        => $card->id,
+                'name'           => $card->name,
+                'type_line'      => $card->type_line,
+                'mana_cost'      => $card->mana_cost,
+                'image_uri'      => $card->image_uri,
+                'quantity'       => max(1, (int) ($entry['quantity'] ?? 1)),
+                'owned_quantity' => (int) ($ownedMap[$card->id] ?? 0),
+                'role'           => $entry['role'] ?? null,
+                'reason'         => $entry['reason'] ?? null,
+            ];
+            })->values()->all(),
+            'unresolved_names' => $resolution['unresolved_names'],
+        ];
+    }
+
+    private function resolveEntriesWithCards(array $entries): array
+    {
+        $scryfall = app(ScryfallService::class);
+        $unresolvedNames = [];
+
+        $resolved = collect($entries)->map(function ($entry) use ($scryfall, &$unresolvedNames) {
+            $name = trim($entry['card_name'] ?? '');
+            if ($name === '') {
+                return null;
+            }
+
+            $lowerName = strtolower($name);
+            $isCategory = str_contains($name, '(e.g.')
+                || str_contains($name, '(e.g.,')
+                || preg_match('/\be\.g\b/i', $name)
+                || preg_match('/^(discard|removal|counter|ramp|draw|fetch|shock|basic|dual|utility|other)\s+(spell|land|card|creature|artifact|enchantment)/i', $lowerName);
+
+            if ($isCategory) {
+                Log::warning('AiChatService: change proposal received category name instead of real card name — skipping', ['name' => $name]);
+                $unresolvedNames[] = $name;
+                return null;
+            }
+
+            $card = Card::whereRaw('LOWER(name) = ?', [strtolower($name)])->first();
+
+            if (! $card) {
+                try {
+                    $data = $scryfall->findCard($name);
+                    $card = Card::updateOrCreate(
+                        ['scryfall_id' => $data['scryfall_id']],
+                        $data
+                    );
+                } catch (\Throwable $e) {
+                    Log::warning('AiChatService: could not resolve change card from Scryfall', ['name' => $name, 'error' => $e->getMessage()]);
+                    $unresolvedNames[] = $name;
+                    return null;
+                }
+            }
+
+            return ['card' => $card, 'entry' => $entry];
+        })->filter()->values();
+
+        return [
+            'resolved' => $resolved,
+            'unresolved_names' => array_values(array_unique($unresolvedNames)),
+        ];
+    }
+
+    private function buildProposalChanges(Conversation $conversation, array $proposedCards, User $user): array
+    {
+        if (! $conversation->deck_id) {
+            return ['added_cards' => [], 'removed_cards' => []];
+        }
+
+        $currentDeck = Deck::where('user_id', $user->id)
+            ->with(['cards' => function ($query) {
+                $query->select('cards.id', 'cards.name', 'cards.type_line', 'cards.mana_cost', 'cards.image_uri');
+            }])
+            ->find($conversation->deck_id);
+
+        if (! $currentDeck) {
+            return ['added_cards' => [], 'removed_cards' => []];
+        }
+
+        $ownedMap = $user->collection()
+            ->withPivot('quantity')
+            ->get()
+            ->keyBy('id')
+            ->map(fn ($c) => $c->pivot->quantity);
+
+        $currentCards = $currentDeck->cards->mapWithKeys(function ($card) use ($ownedMap) {
+            return [$card->id => [
+                'card_id'        => $card->id,
+                'name'           => $card->name,
+                'type_line'      => $card->type_line,
+                'mana_cost'      => $card->mana_cost,
+                'image_uri'      => $card->image_uri,
+                'quantity'       => (int) $card->pivot->quantity,
+                'owned_quantity' => (int) ($ownedMap[$card->id] ?? 0),
+                'role'           => null,
+                'reason'         => null,
+            ]];
+        })->all();
+
+        $proposedMap = collect($proposedCards)->keyBy('card_id')->all();
+        $allCardIds = array_unique(array_merge(array_keys($currentCards), array_keys($proposedMap)));
+
+        $addedCards = [];
+        $removedCards = [];
+
+        foreach ($allCardIds as $cardId) {
+            $before = $currentCards[$cardId] ?? null;
+            $after = $proposedMap[$cardId] ?? null;
+
+            $beforeQty = (int) ($before['quantity'] ?? 0);
+            $afterQty = (int) ($after['quantity'] ?? 0);
+
+            if ($afterQty > $beforeQty) {
+                $change = $after;
+                $change['quantity'] = $afterQty - $beforeQty;
+                $addedCards[] = $change;
+            }
+
+            if ($beforeQty > $afterQty) {
+                $change = $before;
+                $change['quantity'] = $beforeQty - $afterQty;
+                $removedCards[] = $change;
+            }
+        }
+
+        usort($addedCards, fn ($a, $b) => strcmp($a['name'] ?? '', $b['name'] ?? ''));
+        usort($removedCards, fn ($a, $b) => strcmp($a['name'] ?? '', $b['name'] ?? ''));
+
+        return [
+            'added_cards' => array_values($addedCards),
+            'removed_cards' => array_values($removedCards),
         ];
     }
 
@@ -864,6 +1152,17 @@ class AiChatService
                 'function' => [
                     'name'        => 'get_decks',
                     'description' => "List the user's existing decks with card counts.",
+                    'parameters'  => [
+                        'type'       => 'object',
+                        'properties' => (object) [],
+                    ],
+                ],
+            ],
+            [
+                'type'     => 'function',
+                'function' => [
+                    'name'        => 'get_active_deck',
+                    'description' => 'Get the full card list for the deck attached to this conversation, including owned quantities and missing quantities. Use this when the user asks to improve, tune, upgrade, or budget-plan an existing deck.',
                     'parameters'  => [
                         'type'       => 'object',
                         'properties' => (object) [],
@@ -932,6 +1231,73 @@ class AiChatService
             [
                 'type'     => 'function',
                 'function' => [
+                    'name'        => 'propose_changes',
+                    'description' => 'Present upgrade recommendations for an existing attached deck. Use this for deck tuning, swap suggestions, and buy recommendations instead of rebuilding the full deck.',
+                    'parameters'  => [
+                        'type'       => 'object',
+                        'properties' => [
+                            'deck_name' => [
+                                'type'        => 'string',
+                                'description' => 'Name of the deck being improved.',
+                            ],
+                            'format' => [
+                                'type'        => 'string',
+                                'description' => 'MTG format (e.g. commander, modern, standard).',
+                            ],
+                            'strategy_summary' => [
+                                'type'        => 'string',
+                                'description' => 'Short summary of what the upgrade is trying to improve.',
+                            ],
+                            'added_cards' => [
+                                'type' => 'array',
+                                'items' => [
+                                    'type'       => 'object',
+                                    'properties' => [
+                                        'card_name' => ['type' => 'string'],
+                                        'quantity'  => ['type' => 'integer', 'minimum' => 1],
+                                        'role'      => ['type' => 'string'],
+                                        'reason'    => ['type' => 'string'],
+                                    ],
+                                    'required' => ['card_name'],
+                                ],
+                                'description' => 'Cards to add to the current deck.',
+                            ],
+                            'removed_cards' => [
+                                'type' => 'array',
+                                'items' => [
+                                    'type'       => 'object',
+                                    'properties' => [
+                                        'card_name' => ['type' => 'string'],
+                                        'quantity'  => ['type' => 'integer', 'minimum' => 1],
+                                        'role'      => ['type' => 'string'],
+                                        'reason'    => ['type' => 'string'],
+                                    ],
+                                    'required' => ['card_name'],
+                                ],
+                                'description' => 'Cards to remove from the current deck.',
+                            ],
+                            'buy_cards' => [
+                                'type' => 'array',
+                                'items' => [
+                                    'type'       => 'object',
+                                    'properties' => [
+                                        'card_name' => ['type' => 'string'],
+                                        'quantity'  => ['type' => 'integer', 'minimum' => 1],
+                                        'role'      => ['type' => 'string'],
+                                        'reason'    => ['type' => 'string'],
+                                    ],
+                                    'required' => ['card_name'],
+                                ],
+                                'description' => 'Cards worth buying that are not currently in the deck.',
+                            ],
+                        ],
+                        'required' => ['deck_name'],
+                    ],
+                ],
+            ],
+            [
+                'type'     => 'function',
+                'function' => [
                     'name'        => 'propose_deck',
                     'description' => 'Present a final deck proposal to the user for confirmation. Call this when you have decided on a complete card list and are ready for the user to review and create the deck.',
                     'parameters'  => [
@@ -975,12 +1341,14 @@ class AiChatService
     // System prompt
     // -------------------------------------------------------------------------
 
-    private function systemPrompt(): string
+    private function systemPrompt(Conversation $conversation): string
     {
-        return <<<'PROMPT'
+        $deckContext = $this->activeDeckPromptContext($conversation);
+
+        return <<<PROMPT
 You are VaultMage, an expert Magic: The Gathering deck building assistant.
 
-Your job is to build decks. When a user describes what they want, start building immediately — do not ask questions first.
+Your job is to build decks and improve existing decks. When a user describes what they want, start working immediately.
 
 Deck size and copy limits (you MUST meet these exactly before calling propose_deck):
 - Commander / EDH: exactly 100 cards. The commander card MUST be included in the `cards` array (with role "commander") — it counts as 1 of the 100. SINGLETON: max 1 copy of every non-basic land card. Basic lands (Plains, Island, Swamp, Mountain, Forest, Wastes, Snow-Covered basics) may appear in any quantity.
@@ -1008,19 +1376,51 @@ CRITICAL — card_name rules for propose_deck:
 - If you are unsure of a card's exact name, use search_scryfall to confirm it before including it in propose_deck.
 
 Rules:
-- Before doing anything else, check whether the user's message provides clear answers to ALL of the following:
-    1. Format (e.g. Commander, Modern, Standard) — required
-    2. Playstyle / archetype (e.g. aggro, control, combo, midrange, tokens, ramp) — required
-    3. Budget (e.g. "under $50", "no budget", "use only cards I own") — required
-  If ANY of these are missing or too vague to act on, ask for them all in a single message before calling any tools. Do not guess or assume defaults — ask the user directly.
-- Once you have format, playstyle, and budget, call get_collection immediately and start building.
+- First decide whether the user wants to build a new deck, improve an existing deck, or figure out what to buy for an existing deck.
+- For a brand-new deck, require all of the following before calling tools:
+    1. Format (e.g. Commander, Modern, Standard)
+    2. Playstyle / archetype (e.g. aggro, control, combo, midrange, tokens, ramp)
+    3. Budget (e.g. "under $50", "no budget", "use only cards I own")
+  If any are missing or too vague, ask for them all in one message. Do not guess defaults.
+- For improving or buying cards for an existing deck, call get_active_deck early if a deck is attached to the conversation.
+- If the user refers to "this deck" or "my deck" but no deck is attached, ask them to open the deck and start the chat from there, or provide the deck name.
+- Once you have enough info for the task, call the relevant tools immediately and start analyzing.
+- For deck improvement, tuning, swap suggestions, and buy recommendations, prefer propose_changes. Do NOT call propose_deck unless the user explicitly asks for a full rebuilt deck list.
 - For Commander decks: call get_commander_guide with the commander name right after get_collection. Use the returned card list as a reference for what staples and support packages experienced players include. Adapt it to the user's collection and budget — don't copy it blindly.
 - Prioritize cards the user owns (they cost $0 extra). Use search_cards to fill gaps from the local database.
-- Budget enforcement: every card in get_collection, search_cards, and search_scryfall results includes a price_usd field (USD, null means unknown). When the user gives a budget, track the running total as you select cards. Do not include any card whose price_usd would cause the total to exceed the budget. If a card's price_usd is null, treat it as $0 for budget purposes (it may simply not have a cached price yet). Prefer cheaper alternatives when a card is over budget.
-- When the user mentions a specific card they don't own, or when a card is not found locally, use search_scryfall to look it up and get its full details before including it in a proposal.
+- Budget enforcement: every card in get_collection, search_cards, and search_scryfall results includes a price_usd field (USD, null means unknown). When the user gives a budget, track the running total as you select cards. Do not include any card whose price_usd would cause the total to exceed the budget. If a card's price_usd is null, treat it as $0 for budget purposes. Prefer cheaper alternatives when a card is over budget.
+- When improving an existing deck, compare the active deck against the user's collection and clearly separate:
+    1. cuts
+    2. cards the user already owns and can swap in now
+    3. cards worth buying
+- When the user asks what to buy, prioritize cards they do not already own and mention cheaper alternatives when useful.
+- When the user mentions a specific card they don't own, or when a card is not found locally, use search_scryfall to look it up and get its full details before recommending it.
+- When using propose_changes, keep the recommendation focused and compact. Only include the cards that should change, not the entire deck.
 - Always verify your card count matches the format requirement before calling propose_deck. If you are short, use search_scryfall to find more cards to fill the deck.
 - When you have a complete card list that meets the deck size requirement, call propose_deck. Do not describe what you are about to do — just do it.
 - Keep conversational text short and direct.
+
+{$deckContext}
 PROMPT;
+    }
+
+    private function activeDeckPromptContext(Conversation $conversation): string
+    {
+        if (! $conversation->deck_id) {
+            return 'Active deck context: none attached to this conversation.';
+        }
+
+        $deck = Deck::withSum('cards as cards_sum_quantity', 'deck_cards.quantity')->find($conversation->deck_id);
+
+        if (! $deck) {
+            return 'Active deck context: attached deck not found.';
+        }
+
+        $colors = empty($deck->color_identity) ? 'colorless or unspecified' : implode('/', $deck->color_identity);
+        $format = $deck->format ?? 'unknown';
+        $count = (int) ($deck->cards_sum_quantity ?? 0);
+        $description = $deck->description ? ' Description: ' . $deck->description : '';
+
+        return "Active deck context: id {$deck->id}, name \"{$deck->name}\", format {$format}, colors {$colors}, total cards {$count}.{$description}";
     }
 }

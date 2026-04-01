@@ -235,6 +235,14 @@ export default function DeckViewScreen() {
         </View>
       </View>
 
+      <TouchableOpacity
+        style={styles.assistantBtn}
+        onPress={() => router.push({ pathname: '/assistant', params: { deckId: String(deck.id), deckName: deck.name } })}
+      >
+        <Ionicons name="sparkles" size={18} color="#fff" />
+        <Text style={styles.assistantBtnText}>Ask AI to improve this deck</Text>
+      </TouchableOpacity>
+
       {sections.length === 0 ? (
         <View style={styles.emptyState}>
           <Ionicons name="layers-outline" size={64} color="#433647" />
@@ -388,6 +396,24 @@ const styles = StyleSheet.create({
   headerInfo: { flex: 1 },
   deckName: { color: '#fff', fontSize: 20, fontWeight: '700' },
   headerMetaRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 2 },
+  assistantBtn: {
+    marginHorizontal: 16,
+    marginTop: 12,
+    marginBottom: 4,
+    backgroundColor: '#6C3CE1',
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  assistantBtnText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '700',
+  },
   deckMeta: { color: '#888', fontSize: 13 },
   deckPrice: { color: '#7dcea0', fontSize: 13, fontWeight: '600', marginTop: 2 },
   colorPips: { flexDirection: 'row', gap: 3 },
