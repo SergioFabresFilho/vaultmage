@@ -1,7 +1,8 @@
 import { CameraView, useCameraPermissions } from 'expo-camera';
+import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 import { useFocusEffect } from 'expo-router';
 import { useCallback, useRef, useState } from 'react';
-import { Animated, ActivityIndicator, Alert, Image, Modal, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { Animated, ActivityIndicator, Alert, Dimensions, Image, Modal, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { useAuth } from '@/context/AuthContext';
 
 const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:8000';
@@ -60,6 +61,9 @@ export default function ScanScreen() {
     );
   }
 
+  const { width: screenWidth, height: screenHeight } = Dimensions.get('window');
+  const { width: previewWidth, height: previewHeight } = getCameraPreviewSize(screenWidth, screenHeight);
+
   function triggerShutter() {
     flashOpacity.setValue(1);
     Animated.timing(flashOpacity, {
@@ -73,17 +77,91 @@ export default function ScanScreen() {
     if (!cameraRef.current || scanning) return;
     triggerShutter();
     setScanning(true);
+    const startedAt = Date.now();
     try {
-      const photo = await cameraRef.current.takePictureAsync({ base64: true, quality: 0.8 });
-      if (!photo?.base64) throw new Error('Failed to capture image.');
+      const captureStartedAt = Date.now();
+      const photo = await cameraRef.current.takePictureAsync({ quality: 0.5 });
+      const captureMs = Date.now() - captureStartedAt;
+      if (!photo?.uri || !photo.width || !photo.height) throw new Error('Failed to capture image.');
 
+      const processStartedAt = Date.now();
+      const { width: screenWidth, height: screenHeight } = Dimensions.get('window');
+      const { width: previewWidth, height: previewHeight } = getCameraPreviewSize(screenWidth, screenHeight);
+      const normalized = await manipulateAsync(
+        photo.uri,
+        [],
+        {
+          compress: 1,
+          format: SaveFormat.JPEG,
+        }
+      );
+      const frameRect = getCardFrameCropRect(normalized.width, normalized.height, previewWidth, previewHeight);
+      const regions = getCardOcrRegions(frameRect);
+      const processedRegions = await Promise.all(
+        regions.map((region) =>
+          manipulateAsync(
+            normalized.uri,
+            [
+              { crop: region.crop },
+              { resize: { width: region.resizeWidth } },
+            ],
+            {
+              compress: 0.35,
+              format: SaveFormat.JPEG,
+              base64: true,
+            }
+          )
+        )
+      );
+      const processMs = Date.now() - processStartedAt;
+
+      const images = processedRegions.map((region) => region.base64).filter((value): value is string => !!value);
+      if (images.length !== processedRegions.length) throw new Error('Failed to prepare scan image.');
+
+      const requestBody = JSON.stringify({ images });
+      const requestStartedAt = Date.now();
       const response = await fetch(`${API_BASE_URL}/api/collection/scan`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ image: photo.base64 }),
+        body: requestBody,
       });
+      const responseReceivedAt = Date.now();
 
+      const parseStartedAt = Date.now();
       const data = await response.json();
+      const parseMs = Date.now() - parseStartedAt;
+      const networkMs = responseReceivedAt - requestStartedAt;
+      const totalMs = Date.now() - startedAt;
+
+      console.log('[scan] timing', {
+        total_ms: totalMs,
+        capture_ms: captureMs,
+        process_ms: processMs,
+        captured_width: photo.width,
+        captured_height: photo.height,
+        normalized_width: normalized.width,
+        normalized_height: normalized.height,
+        frame_origin_x: frameRect.originX,
+        frame_origin_y: frameRect.originY,
+        frame_width: frameRect.width,
+        frame_height: frameRect.height,
+        region_count: processedRegions.length,
+        regions: processedRegions.map((region, index) => ({
+          index,
+          origin_x: regions[index]?.crop.originX ?? 0,
+          origin_y: regions[index]?.crop.originY ?? 0,
+          crop_width: regions[index]?.crop.width ?? 0,
+          crop_height: regions[index]?.crop.height ?? 0,
+          resize_target_width: regions[index]?.resizeWidth ?? 0,
+          width: region.width,
+          height: region.height,
+          bytes: images[index]?.length ?? 0,
+        })),
+        request_payload_bytes: requestBody.length,
+        network_ms: networkMs,
+        response_parse_ms: parseMs,
+        status: response.status,
+      });
 
       if (!response.ok) {
         const message = data?.message ?? data?.errors?.image?.[0] ?? 'Scan failed.';
@@ -99,6 +177,11 @@ export default function ScanScreen() {
         type_line: data.type_line,
         rarity: data.rarity,
         image_uri: data.image_uri ?? null,
+      });
+      console.log('[scan] result', {
+        name: data.name,
+        set_code: data.set_code,
+        collector_number: data.collector_number,
       });
     } catch (e: any) {
       console.error('[scan] Unexpected error during scan:', e);
@@ -133,28 +216,19 @@ export default function ScanScreen() {
 
   return (
     <View style={styles.container}>
-      {isCameraActive && <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" />}
+      <View style={[styles.cameraStage, { width: previewWidth, height: previewHeight }]}>
+        {isCameraActive && <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" />}
 
-      {/* Dimmed overlay with card frame cutout */}
-      <View style={StyleSheet.absoluteFill} pointerEvents="none">
-        {/* Top dim */}
-        <View style={styles.dimTop} />
-
-        {/* Middle row: side dims + card frame */}
-        <View style={styles.middleRow}>
-          <View style={styles.dimSide} />
-          <View style={styles.cardFrame}>
-            {/* Corner markers */}
-            <View style={[styles.corner, styles.topLeft]} />
-            <View style={[styles.corner, styles.topRight]} />
-            <View style={[styles.corner, styles.bottomLeft]} />
-            <View style={[styles.corner, styles.bottomRight]} />
+        <View style={StyleSheet.absoluteFill} pointerEvents="none">
+          <View style={styles.cameraOverlay}>
+            <View style={styles.cardFrame}>
+              <View style={[styles.corner, styles.topLeft]} />
+              <View style={[styles.corner, styles.topRight]} />
+              <View style={[styles.corner, styles.bottomLeft]} />
+              <View style={[styles.corner, styles.bottomRight]} />
+            </View>
           </View>
-          <View style={styles.dimSide} />
         </View>
-
-        {/* Bottom dim */}
-        <View style={styles.dimBottom} />
       </View>
 
       {/* Shutter flash overlay */}
@@ -238,6 +312,94 @@ const CARD_WIDTH = 260;
 const CARD_HEIGHT = 363; // standard MTG card ratio ~1:1.4
 const CORNER_SIZE = 24;
 const CORNER_THICKNESS = 3;
+const CAMERA_PREVIEW_RATIO = 3 / 4;
+const OCR_SIDE_INSET_RATIO = 0.02;
+const OCR_TOP_INSET_RATIO = 0;
+const OCR_BOTTOM_INSET_RATIO = 0;
+const OCR_TOP_HEIGHT_RATIO = 0.12;
+const OCR_BOTTOM_HEIGHT_RATIO = 0.12;
+
+function getCameraPreviewSize(screenWidth: number, screenHeight: number) {
+  const horizontalPadding = 24;
+  const width = Math.min(screenWidth - horizontalPadding, Math.floor(screenHeight * CAMERA_PREVIEW_RATIO));
+  const height = Math.floor(width / CAMERA_PREVIEW_RATIO);
+
+  return { width, height };
+}
+
+function getCardFrameCropRect(imageWidth: number, imageHeight: number, viewportWidth: number, viewportHeight: number) {
+  const frameX = (viewportWidth - CARD_WIDTH) / 2;
+  const frameY = (viewportHeight - CARD_HEIGHT) / 2;
+
+  const imageAspect = imageWidth / imageHeight;
+  const viewportAspect = viewportWidth / viewportHeight;
+
+  let scale = 1;
+  let offsetX = 0;
+  let offsetY = 0;
+
+  if (imageAspect > viewportAspect) {
+    scale = viewportHeight / imageHeight;
+    const displayedWidth = imageWidth * scale;
+    offsetX = (displayedWidth - viewportWidth) / 2;
+  } else {
+    scale = viewportWidth / imageWidth;
+    const displayedHeight = imageHeight * scale;
+    offsetY = (displayedHeight - viewportHeight) / 2;
+  }
+
+  const inset = 10;
+  const cropX = Math.max(0, Math.round((frameX + inset + offsetX) / scale));
+  const cropY = Math.max(0, Math.round((frameY + inset + offsetY) / scale));
+  const cropWidth = Math.min(
+    imageWidth - cropX,
+    Math.round((CARD_WIDTH - inset * 2) / scale)
+  );
+  const cropHeight = Math.min(
+    imageHeight - cropY,
+    Math.round((CARD_HEIGHT - inset * 2) / scale)
+  );
+
+  return {
+    originX: cropX,
+    originY: cropY,
+    width: Math.max(1, cropWidth),
+    height: Math.max(1, cropHeight),
+  };
+}
+
+function getCardOcrRegions(frame: { originX: number; originY: number; width: number; height: number }) {
+  const sideInset = Math.round(frame.width * OCR_SIDE_INSET_RATIO);
+  const topInset = Math.round(frame.height * OCR_TOP_INSET_RATIO);
+  const bottomInset = Math.round(frame.height * OCR_BOTTOM_INSET_RATIO);
+
+  const usableX = frame.originX + sideInset;
+  const usableWidth = Math.max(1, frame.width - sideInset * 2);
+
+  const topHeight = Math.max(1, Math.round(frame.height * OCR_TOP_HEIGHT_RATIO));
+  const bottomHeight = Math.max(1, Math.round(frame.height * OCR_BOTTOM_HEIGHT_RATIO));
+
+  return [
+    {
+      crop: {
+        originX: usableX,
+        originY: frame.originY + topInset,
+        width: usableWidth,
+        height: topHeight,
+      },
+      resizeWidth: 1200,
+    },
+    {
+      crop: {
+        originX: usableX,
+        originY: Math.max(frame.originY, frame.originY + frame.height - bottomHeight - bottomInset),
+        width: usableWidth,
+        height: bottomHeight,
+      },
+      resizeWidth: 1200,
+    },
+  ];
+}
 const CORNER_COLOR = '#fff';
 
 const styles = StyleSheet.create({
@@ -266,24 +428,16 @@ const styles = StyleSheet.create({
     fontSize: 15,
   },
 
-  // Overlay dims
-  dimTop: {
-    width: '100%',
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.55)',
+  cameraStage: {
+    overflow: 'hidden',
+    borderRadius: 18,
+    backgroundColor: '#000',
   },
-  middleRow: {
-    flexDirection: 'row',
-    height: CARD_HEIGHT,
-  },
-  dimSide: {
+  cameraOverlay: {
     flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.55)',
-  },
-  dimBottom: {
-    width: '100%',
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.55)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(0,0,0,0.18)',
   },
 
   // Transparent card frame
@@ -291,6 +445,7 @@ const styles = StyleSheet.create({
     width: CARD_WIDTH,
     height: CARD_HEIGHT,
     backgroundColor: 'transparent',
+    position: 'relative',
   },
 
   // Corner markers

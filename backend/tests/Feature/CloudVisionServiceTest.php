@@ -70,6 +70,25 @@ class CloudVisionServiceTest extends TestCase
         $this->assertEquals($expectedText, $result);
     }
 
+    public function test_it_extracts_card_text_from_multiple_regions()
+    {
+        $top = base64_encode('fake-card-top');
+        $bottom = base64_encode('fake-card-bottom');
+
+        $this->mock(OcrClient::class, function (MockInterface $mock) {
+            $mock->shouldReceive('textDetection')
+                ->once()
+                ->with([base64_decode('ZmFrZS1jYXJkLXRvcA=='), base64_decode('ZmFrZS1jYXJkLWJvdHRvbQ==')])
+                ->andReturn(['Overcome', "M19\n186/280 C"]);
+        });
+
+        /** @var CloudVisionService $service */
+        $service = app(CloudVisionService::class);
+        $result = $service->extractCardTexts([$top, $bottom]);
+
+        $this->assertEquals("Overcome\nM19\n186/280 C", $result);
+    }
+
     public function test_it_throws_exception_on_invalid_base64()
     {
         /** @var CloudVisionService $service */

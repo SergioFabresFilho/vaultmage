@@ -190,7 +190,7 @@ class CollectionTest extends TestCase
         ];
 
         $this->mock(CloudVisionService::class, function (MockInterface $mock) use ($ocrText) {
-            $mock->shouldReceive('extractCardText')->andReturn($ocrText);
+            $mock->shouldReceive('extractCardTexts')->andReturn($ocrText);
         });
 
         $this->mock(ScryfallService::class, function (MockInterface $mock) use ($cardData) {
@@ -230,7 +230,7 @@ class CollectionTest extends TestCase
         ];
 
         $this->mock(CloudVisionService::class, function (MockInterface $mock) use ($ocrText) {
-            $mock->shouldReceive('extractCardText')
+            $mock->shouldReceive('extractCardTexts')
                 ->andReturn($ocrText);
         });
 
@@ -250,12 +250,49 @@ class CollectionTest extends TestCase
             ->assertJsonPath('scryfall_id', 'f9b8a159-5e58-4432-8ecd-62f39afa96da');
     }
 
+    public function test_it_scans_a_card_from_local_database_without_scryfall_lookup()
+    {
+        $base64Image = base64_encode('fake-image-content');
+        $ocrText = "Opt\nInstant\nM21 · 059/274";
+        $card = Card::factory()->create([
+            'scryfall_id' => 'f9b8a159-5e58-4432-8ecd-62f39afa96da',
+            'name' => 'Opt',
+            'set_code' => 'M21',
+            'set_name' => 'Core Set 2021',
+            'collector_number' => '059',
+            'rarity' => 'common',
+            'mana_cost' => '{U}',
+            'type_line' => 'Instant',
+            'image_uri' => 'https://example.com/opt.jpg',
+        ]);
+
+        $this->mock(CloudVisionService::class, function (MockInterface $mock) use ($ocrText) {
+            $mock->shouldReceive('extractCardTexts')
+                ->andReturn($ocrText);
+        });
+
+        $this->mock(ScryfallService::class, function (MockInterface $mock) {
+            $mock->shouldNotReceive('findCardBySetAndNumber');
+            $mock->shouldNotReceive('findCard');
+        });
+
+        $response = $this->actingAs($this->user)
+            ->postJson('/api/collection/scan', [
+                'image' => $base64Image,
+            ]);
+
+        $response->assertStatus(200)
+            ->assertJsonPath('id', $card->id)
+            ->assertJsonPath('name', 'Opt')
+            ->assertJsonPath('scryfall_id', 'f9b8a159-5e58-4432-8ecd-62f39afa96da');
+    }
+
     public function test_it_returns_error_when_scan_produces_no_text()
     {
         $base64Image = base64_encode('fake-image-content');
 
         $this->mock(CloudVisionService::class, function (MockInterface $mock) {
-            $mock->shouldReceive('extractCardText')
+            $mock->shouldReceive('extractCardTexts')
                 ->andReturn("");
         });
 
@@ -273,7 +310,7 @@ class CollectionTest extends TestCase
         $base64Image = base64_encode('fake-image-content');
 
         $this->mock(CloudVisionService::class, function (MockInterface $mock) {
-            $mock->shouldReceive('extractCardText')
+            $mock->shouldReceive('extractCardTexts')
                 ->andReturn("\n\n\n");
         });
 
