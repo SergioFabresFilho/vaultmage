@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -22,33 +22,47 @@ import { useAuth } from '@/context/AuthContext';
 const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:8000';
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
-type CollectionCard = {
-  id: number;
+type BaseCard = {
+  id?: number;
   scryfall_id: string;
   name: string;
   set_name: string;
   set_code: string;
+  collector_number?: string;
   rarity: string;
   type_line: string;
   mana_cost: string | null;
-  color_identity: string[];
+  color_identity?: string[];
   image_uri: string | null;
+};
+
+type CollectionCard = BaseCard & {
+  id: number;
   pivot: {
     quantity: number;
     foil: boolean;
   };
 };
 
+type SearchCard = BaseCard;
+
+type SelectedCard = CollectionCard | SearchCard;
+
 type Deck = {
   id: number;
   name: string;
   format: string | null;
-  cards_count: number;
+  cards_sum_quantity: number;
 };
 
-// ─── Color filter config ───────────────────────────────────────────────────
-
+type BrowserMode = 'collection' | 'search';
 type ColorFilter = 'all' | 'W' | 'U' | 'B' | 'R' | 'G' | 'M' | 'C';
+type HeaderItem = { kind: 'header'; title: string; count: number };
+type RowItem = { kind: 'row'; cards: CollectionCard[] };
+type ListItem = HeaderItem | RowItem;
+
+const CARD_WIDTH = 160;
+const CARD_HEIGHT = 224;
 
 const MANA_ICON_URL: Partial<Record<ColorFilter, string>> = {
   W: 'https://svgs.scryfall.io/card-symbols/W.svg',
@@ -60,25 +74,15 @@ const MANA_ICON_URL: Partial<Record<ColorFilter, string>> = {
 };
 
 const COLOR_FILTERS: { key: ColorFilter; label: string; bg: string; border: string; text: string }[] = [
-  { key: 'all', label: 'All',   bg: '#2a2a3e', border: '#444', text: '#fff' },
-  { key: 'W',   label: 'W',    bg: '#2a2a3e', border: '#444', text: '#fff' },
-  { key: 'U',   label: 'U',    bg: '#2a2a3e', border: '#444', text: '#fff' },
-  { key: 'B',   label: 'B',    bg: '#2a2a3e', border: '#444', text: '#fff' },
-  { key: 'R',   label: 'R',    bg: '#2a2a3e', border: '#444', text: '#fff' },
-  { key: 'G',   label: 'G',    bg: '#2a2a3e', border: '#444', text: '#fff' },
-  { key: 'M',   label: 'Multi', bg: '#c8960c', border: '#a07a08', text: '#fff' },
-  { key: 'C',   label: 'C',    bg: '#2a2a3e', border: '#444', text: '#fff' },
+  { key: 'all', label: 'All', bg: '#2a2a3e', border: '#444', text: '#fff' },
+  { key: 'W', label: 'W', bg: '#2a2a3e', border: '#444', text: '#fff' },
+  { key: 'U', label: 'U', bg: '#2a2a3e', border: '#444', text: '#fff' },
+  { key: 'B', label: 'B', bg: '#2a2a3e', border: '#444', text: '#fff' },
+  { key: 'R', label: 'R', bg: '#2a2a3e', border: '#444', text: '#fff' },
+  { key: 'G', label: 'G', bg: '#2a2a3e', border: '#444', text: '#fff' },
+  { key: 'M', label: 'Multi', bg: '#c8960c', border: '#a07a08', text: '#fff' },
+  { key: 'C', label: 'C', bg: '#2a2a3e', border: '#444', text: '#fff' },
 ];
-
-function matchesColor(card: CollectionCard, filter: ColorFilter): boolean {
-  if (filter === 'all') return true;
-  const ci = card.color_identity ?? [];
-  if (filter === 'C') return ci.length === 0;
-  if (filter === 'M') return ci.length >= 2;
-  return ci.length === 1 && ci[0] === filter;
-}
-
-// ─── Card type grouping ────────────────────────────────────────────────────
 
 const TYPE_ORDER = [
   'Planeswalker',
@@ -92,23 +96,25 @@ const TYPE_ORDER = [
   'Other',
 ];
 
+function matchesColor(card: CollectionCard, filter: ColorFilter): boolean {
+  if (filter === 'all') return true;
+  const ci = card.color_identity ?? [];
+  if (filter === 'C') return ci.length === 0;
+  if (filter === 'M') return ci.length >= 2;
+  return ci.length === 1 && ci[0] === filter;
+}
+
 function cardTypeGroup(typeLine: string): string {
   if (!typeLine) return 'Other';
-  for (const t of TYPE_ORDER.slice(0, -1)) {
-    if (typeLine.includes(t)) return t;
+  for (const type of TYPE_ORDER.slice(0, -1)) {
+    if (typeLine.includes(type)) return type;
   }
   return 'Other';
 }
 
-// ─── List items ────────────────────────────────────────────────────────────
-
-type HeaderItem = { kind: 'header'; title: string; count: number };
-type RowItem    = { kind: 'row';    cards: CollectionCard[] };
-type ListItem   = HeaderItem | RowItem;
-
 function buildListData(cards: CollectionCard[], collapsed: Set<string>): ListItem[] {
-  // Group by type
   const groups: Record<string, CollectionCard[]> = {};
+
   for (const card of cards) {
     const group = cardTypeGroup(card.type_line);
     if (!groups[group]) groups[group] = [];
@@ -118,30 +124,70 @@ function buildListData(cards: CollectionCard[], collapsed: Set<string>): ListIte
   const items: ListItem[] = [];
   for (const type of TYPE_ORDER) {
     const group = groups[type];
-    if (!group || group.length === 0) continue;
+    if (!group?.length) continue;
     items.push({ kind: 'header', title: type, count: group.length });
     if (collapsed.has(type)) continue;
-    // chunk into rows of 2
-    for (let i = 0; i < group.length; i += 2) {
-      items.push({ kind: 'row', cards: group.slice(i, i + 2) });
+
+    for (let index = 0; index < group.length; index += 2) {
+      items.push({ kind: 'row', cards: group.slice(index, index + 2) });
     }
   }
+
   return items;
 }
 
-// ─── Main screen ──────────────────────────────────────────────────────────
+function isCollectionCard(card: SelectedCard | null): card is CollectionCard {
+  return !!card && 'pivot' in card;
+}
+
+function ManaCost({ cost, size = 14 }: { cost: string | null; size?: number }) {
+  if (!cost) return null;
+
+  const symbols = cost.match(/{([^}]+)}/g) || [];
+
+  return (
+    <View style={styles.manaCostContainer}>
+      {symbols.map((symbol, index) => {
+        const name = symbol.slice(1, -1).replace(/\//g, '').toUpperCase();
+        const svgUrl = `https://svgs.scryfall.io/card-symbols/${name}.svg`;
+        const uri = `https://images.weserv.nl/?url=${encodeURIComponent(svgUrl)}&output=png&w=${size * 2}`;
+
+        return (
+          <Image
+            key={`${name}-${index}`}
+            source={{ uri }}
+            style={{ width: size, height: size, marginLeft: 2 }}
+            resizeMode="contain"
+          />
+        );
+      })}
+    </View>
+  );
+}
 
 export default function CollectionScreen() {
   const { token } = useAuth();
   const router = useRouter();
+
   const [cards, setCards] = useState<CollectionCard[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-
-  // Filters
-  const [search, setSearch] = useState('');
+  const [mode, setMode] = useState<BrowserMode>('collection');
+  const [query, setQuery] = useState('');
+  const [debouncedQuery, setDebouncedQuery] = useState('');
   const [colorFilter, setColorFilter] = useState<ColorFilter>('all');
   const [collapsedSections, setCollapsedSections] = useState<Set<string>>(new Set());
+
+  const [searchResults, setSearchResults] = useState<SearchCard[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+
+  const [selectedCard, setSelectedCard] = useState<SelectedCard | null>(null);
+  const [modalView, setModalView] = useState<'card' | 'deck-picker'>('card');
+  const [updatingCollection, setUpdatingCollection] = useState(false);
+  const [decks, setDecks] = useState<Deck[]>([]);
+  const [loadingDecks, setLoadingDecks] = useState(false);
+  const [addingToDeck, setAddingToDeck] = useState(false);
 
   const toggleSection = (title: string) => {
     setCollapsedSections(prev => {
@@ -152,26 +198,48 @@ export default function CollectionScreen() {
     });
   };
 
-  // Card detail modal
-  const [selectedCard, setSelectedCard] = useState<CollectionCard | null>(null);
-  const [updating, setUpdating] = useState(false);
-
-  // Deck picker
-  const [decks, setDecks] = useState<Deck[]>([]);
-  const [loadingDecks, setLoadingDecks] = useState(false);
-  const [addingToDeck, setAddingToDeck] = useState(false);
-  const [modalView, setModalView] = useState<'card' | 'deck-picker'>('card');
-
   const fetchCollection = useCallback(async () => {
     try {
       const response = await fetch(`${API_BASE_URL}/api/collection`, {
         headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
       });
+
       if (!response.ok) return;
+
       const data = await response.json();
       setCards(data);
     } catch {
-      // network error — leave previous state intact
+      // Leave previous state intact on network errors.
+    }
+  }, [token]);
+
+  const performSearch = useCallback(async (value: string) => {
+    if (!value.trim()) {
+      setSearchResults([]);
+      setSearchError(null);
+      return;
+    }
+
+    setSearchLoading(true);
+    setSearchError(null);
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/cards/search?q=${encodeURIComponent(value)}`, {
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+      });
+
+      if (!response.ok) throw new Error('Search failed');
+
+      const data = await response.json();
+      setSearchResults(data);
+    } catch (error) {
+      console.error(error);
+      setSearchError('Could not complete search. Please try again.');
+    } finally {
+      setSearchLoading(false);
     }
   }, [token]);
 
@@ -179,67 +247,35 @@ export default function CollectionScreen() {
     fetchCollection().finally(() => setLoading(false));
   }, [fetchCollection]);
 
-  async function handleRefresh() {
-    setRefreshing(true);
-    await fetchCollection();
-    setRefreshing(false);
-  }
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedQuery(query);
+    }, 500);
 
-  // Filtered + grouped list data
-  const listData = useMemo<ListItem[]>(() => {
-    const q = search.trim().toLowerCase();
+    return () => clearTimeout(timer);
+  }, [query]);
+
+  useEffect(() => {
+    if (mode !== 'search') return;
+    performSearch(debouncedQuery);
+  }, [debouncedQuery, mode, performSearch]);
+
+  const collectionListData = useMemo<ListItem[]>(() => {
+    const normalizedQuery = query.trim().toLowerCase();
     const filtered = cards.filter(card => {
-      const matchesSearch = !q || card.name.toLowerCase().includes(q);
+      const matchesSearch = !normalizedQuery || card.name.toLowerCase().includes(normalizedQuery);
       return matchesSearch && matchesColor(card, colorFilter);
     });
+
     return buildListData(filtered, collapsedSections);
-  }, [cards, search, colorFilter, collapsedSections]);
+  }, [cards, query, colorFilter, collapsedSections]);
 
   const totalFiltered = useMemo(
-    () => listData.filter(i => i.kind === 'row').reduce((sum, i) => sum + (i as RowItem).cards.length, 0),
-    [listData],
+    () => collectionListData
+      .filter(item => item.kind === 'row')
+      .reduce((sum, item) => sum + (item as RowItem).cards.length, 0),
+    [collectionListData],
   );
-
-  async function handleQuantityChange(delta: number) {
-    if (!selectedCard || updating) return;
-
-    const newQuantity = selectedCard.pivot.quantity + delta;
-    const updatedCard = { ...selectedCard, pivot: { ...selectedCard.pivot, quantity: newQuantity } };
-    setSelectedCard(updatedCard);
-    setCards(prev =>
-      newQuantity <= 0
-        ? prev.filter(c => !(c.id === selectedCard.id && c.pivot.foil === selectedCard.pivot.foil))
-        : prev.map(c =>
-            c.id === selectedCard.id && c.pivot.foil === selectedCard.pivot.foil ? updatedCard : c
-          )
-    );
-
-    setUpdating(true);
-    try {
-      const response = await fetch(`${API_BASE_URL}/api/collection/${selectedCard.id}`, {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ quantity: newQuantity, foil: selectedCard.pivot.foil }),
-      });
-
-      if (!response.ok) throw new Error('Update failed');
-      if (newQuantity <= 0) setSelectedCard(null);
-    } catch {
-      setSelectedCard(selectedCard);
-      setCards(prev =>
-        prev.map(c =>
-          c.id === selectedCard.id && c.pivot.foil === selectedCard.pivot.foil ? selectedCard : c
-        )
-      );
-      Alert.alert('Error', 'Could not update quantity.');
-    } finally {
-      setUpdating(false);
-    }
-  }
 
   const fetchDecks = async () => {
     setLoadingDecks(true);
@@ -255,6 +291,91 @@ export default function CollectionScreen() {
     }
   };
 
+  async function handleRefresh() {
+    if (mode === 'search') {
+      await performSearch(query);
+      return;
+    }
+
+    setRefreshing(true);
+    await fetchCollection();
+    setRefreshing(false);
+  }
+
+  async function handleQuantityChange(delta: number) {
+    if (!isCollectionCard(selectedCard) || updatingCollection) return;
+
+    const previousCard = selectedCard;
+    const newQuantity = previousCard.pivot.quantity + delta;
+    const updatedCard: CollectionCard = {
+      ...previousCard,
+      pivot: { ...previousCard.pivot, quantity: newQuantity },
+    };
+
+    setSelectedCard(updatedCard);
+    setCards(prev =>
+      newQuantity <= 0
+        ? prev.filter(card => !(card.id === previousCard.id && card.pivot.foil === previousCard.pivot.foil))
+        : prev.map(card =>
+            card.id === previousCard.id && card.pivot.foil === previousCard.pivot.foil ? updatedCard : card,
+          ),
+    );
+
+    setUpdatingCollection(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/collection/${previousCard.id}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ quantity: newQuantity, foil: previousCard.pivot.foil }),
+      });
+
+      if (!response.ok) throw new Error('Update failed');
+      if (newQuantity <= 0) setSelectedCard(null);
+    } catch {
+      setSelectedCard(previousCard);
+      setCards(prev =>
+        prev.map(card =>
+          card.id === previousCard.id && card.pivot.foil === previousCard.pivot.foil ? previousCard : card,
+        ),
+      );
+      Alert.alert('Error', 'Could not update quantity.');
+    } finally {
+      setUpdatingCollection(false);
+    }
+  }
+
+  const addToCollection = async (card: SearchCard) => {
+    setUpdatingCollection(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/collection`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          scryfall_id: card.scryfall_id,
+          foil: false,
+        }),
+      });
+
+      if (!response.ok) throw new Error('Failed to add card');
+
+      await fetchCollection();
+      setSelectedCard(null);
+      Alert.alert('Success', `${card.name} added to your collection!`);
+    } catch {
+      Alert.alert('Error', 'Could not add card to collection.');
+    } finally {
+      setUpdatingCollection(false);
+    }
+  };
+
   const handleOpenDeckPicker = () => {
     fetchDecks();
     setModalView('deck-picker');
@@ -262,6 +383,7 @@ export default function CollectionScreen() {
 
   const addToDeck = async (deckId: number) => {
     if (!selectedCard) return;
+
     setAddingToDeck(true);
     try {
       const response = await fetch(`${API_BASE_URL}/api/decks/${deckId}/cards`, {
@@ -273,19 +395,27 @@ export default function CollectionScreen() {
         },
         body: JSON.stringify({ scryfall_id: selectedCard.scryfall_id, quantity: 1 }),
       });
-      if (response.ok) {
-        setModalView('card');
-        setSelectedCard(null);
-        Alert.alert('Success', `${selectedCard.name} added to deck!`);
-      } else {
-        throw new Error('Failed to add to deck');
-      }
+
+      if (!response.ok) throw new Error('Failed to add to deck');
+
+      setModalView('card');
+      setSelectedCard(null);
+      Alert.alert('Success', `${selectedCard.name} added to deck!`);
     } catch {
       Alert.alert('Error', 'Could not add card to deck.');
     } finally {
       setAddingToDeck(false);
     }
   };
+
+  const headerCount =
+    mode === 'collection'
+      ? cards.length > 0
+        ? `${totalFiltered}/${cards.length}`
+        : null
+      : debouncedQuery
+        ? `${searchResults.length} result${searchResults.length === 1 ? '' : 's'}`
+        : null;
 
   if (loading) {
     return (
@@ -297,136 +427,209 @@ export default function CollectionScreen() {
 
   return (
     <View style={styles.container}>
-      {/* ── Header ── */}
       <View style={styles.headerRow}>
-        <Text style={styles.header}>My Collection</Text>
-        {cards.length > 0 && (
-          <Text style={styles.headerCount}>
-            {totalFiltered}/{cards.length}
+        <Text style={styles.header}>Collection</Text>
+        {headerCount ? <Text style={styles.headerCount}>{headerCount}</Text> : null}
+      </View>
+
+      <View style={styles.modeSwitcher}>
+        <TouchableOpacity
+          style={[styles.modeButton, mode === 'collection' && styles.modeButtonActive]}
+          onPress={() => setMode('collection')}
+        >
+          <Text style={[styles.modeButtonText, mode === 'collection' && styles.modeButtonTextActive]}>
+            My Collection
           </Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.modeButton, mode === 'search' && styles.modeButtonActive]}
+          onPress={() => setMode('search')}
+        >
+          <Text style={[styles.modeButtonText, mode === 'search' && styles.modeButtonTextActive]}>
+            Search All Cards
+          </Text>
+        </TouchableOpacity>
+      </View>
+
+      <View style={styles.searchBar}>
+        <Ionicons name="search" size={16} color="#666" style={styles.searchIcon} />
+        <TextInput
+          style={styles.searchInput}
+          placeholder={mode === 'collection' ? 'Search your collection…' : 'Search all cards…'}
+          placeholderTextColor="#555"
+          value={query}
+          onChangeText={setQuery}
+          returnKeyType="search"
+          clearButtonMode="while-editing"
+          autoCorrect={false}
+        />
+        {query.length > 0 && Platform.OS === 'android' && (
+          <TouchableOpacity onPress={() => setQuery('')} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+            <Ionicons name="close-circle" size={16} color="#666" />
+          </TouchableOpacity>
         )}
       </View>
 
-      {/* ── Search bar ── */}
-      {cards.length > 0 && (
-        <View style={styles.searchBar}>
-          <Ionicons name="search" size={16} color="#666" style={styles.searchIcon} />
-          <TextInput
-            style={styles.searchInput}
-            placeholder="Search by name…"
-            placeholderTextColor="#555"
-            value={search}
-            onChangeText={setSearch}
-            returnKeyType="search"
-            clearButtonMode="while-editing"
-            autoCorrect={false}
-          />
-          {search.length > 0 && Platform.OS === 'android' && (
-            <TouchableOpacity onPress={() => setSearch('')} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
-              <Ionicons name="close-circle" size={16} color="#666" />
-            </TouchableOpacity>
-          )}
-        </View>
-      )}
-
-      {/* ── Color filter row ── */}
-      {cards.length > 0 && (
+      {mode === 'collection' && cards.length > 0 ? (
         <ScrollView
           horizontal
           showsHorizontalScrollIndicator={false}
           style={styles.colorFilterScroll}
           contentContainerStyle={styles.colorFilterRow}
         >
-          {COLOR_FILTERS.map(cf => {
-            const iconUrl = MANA_ICON_URL[cf.key];
+          {COLOR_FILTERS.map(filter => {
+            const iconUrl = MANA_ICON_URL[filter.key];
             return (
               <TouchableOpacity
-                key={cf.key}
+                key={filter.key}
                 style={[
                   iconUrl ? styles.colorChipIcon : styles.colorChip,
-                  !iconUrl && { backgroundColor: cf.bg, borderColor: cf.border },
-                  colorFilter === cf.key && styles.colorChipActive,
+                  !iconUrl && { backgroundColor: filter.bg, borderColor: filter.border },
+                  colorFilter === filter.key && styles.colorChipActive,
                 ]}
-                onPress={() => setColorFilter(cf.key)}
+                onPress={() => setColorFilter(filter.key)}
                 activeOpacity={0.7}
               >
                 {iconUrl ? (
                   <SvgUri width={22} height={22} uri={iconUrl} />
                 ) : (
-                  <Text style={[styles.colorChipText, { color: cf.text }]}>{cf.label}</Text>
+                  <Text style={[styles.colorChipText, { color: filter.text }]}>{filter.label}</Text>
                 )}
               </TouchableOpacity>
             );
           })}
         </ScrollView>
+      ) : null}
+
+      {mode === 'collection' ? (
+        <FlatList
+          data={collectionListData}
+          keyExtractor={(item, index) => item.kind === 'header' ? `header-${item.title}` : `row-${index}`}
+          contentContainerStyle={collectionListData.length === 0 ? styles.emptyContent : styles.listContent}
+          refreshing={refreshing}
+          onRefresh={handleRefresh}
+          ListEmptyComponent={
+            cards.length === 0 ? (
+              <View style={styles.emptyState}>
+                <Text style={styles.emptyTitle}>No cards yet</Text>
+                <Text style={styles.emptySubtitle}>Scan your first card to start your collection.</Text>
+                <TouchableOpacity style={styles.scanCta} onPress={() => router.push('/(tabs)/scan')}>
+                  <Text style={styles.scanCtaText}>Scan a Card</Text>
+                </TouchableOpacity>
+              </View>
+            ) : (
+              <View style={styles.emptyState}>
+                <Ionicons name="search-outline" size={40} color="#444" />
+                <Text style={styles.emptyTitle}>No matches</Text>
+                <Text style={styles.emptySubtitle}>Try a different name or color filter.</Text>
+              </View>
+            )
+          }
+          renderItem={({ item }) => {
+            if (item.kind === 'header') {
+              const isCollapsed = collapsedSections.has(item.title);
+              return (
+                <TouchableOpacity
+                  style={styles.sectionHeader}
+                  onPress={() => toggleSection(item.title)}
+                  activeOpacity={0.7}
+                >
+                  <Text style={styles.sectionHeaderText}>{item.title}</Text>
+                  <View style={styles.sectionHeaderRight}>
+                    <Text style={styles.sectionHeaderCount}>{item.count}</Text>
+                    <Ionicons
+                      name={isCollapsed ? 'chevron-forward' : 'chevron-down'}
+                      size={14}
+                      color="#555"
+                    />
+                  </View>
+                </TouchableOpacity>
+              );
+            }
+
+            return (
+              <View style={styles.row}>
+                {item.cards.map(card => (
+                  <TouchableOpacity
+                    key={`${card.scryfall_id}-${card.pivot.foil}`}
+                    onPress={() => {
+                      setModalView('card');
+                      setSelectedCard(card);
+                    }}
+                    activeOpacity={0.8}
+                  >
+                    <CardItem card={card} />
+                  </TouchableOpacity>
+                ))}
+                {item.cards.length === 1 ? <View style={{ width: CARD_WIDTH }} /> : null}
+              </View>
+            );
+          }}
+        />
+      ) : searchLoading ? (
+        <View style={styles.centered}>
+          <ActivityIndicator size="large" color="#6C3CE1" />
+        </View>
+      ) : searchError ? (
+        <View style={styles.centered}>
+          <Text style={styles.errorText}>{searchError}</Text>
+        </View>
+      ) : (
+        <FlatList
+          data={searchResults}
+          keyExtractor={item => item.scryfall_id}
+          contentContainerStyle={styles.searchListContent}
+          onRefresh={handleRefresh}
+          refreshing={false}
+          renderItem={({ item }) => (
+            <TouchableOpacity
+              style={styles.resultItem}
+              onPress={() => {
+                setModalView('card');
+                setSelectedCard(item);
+              }}
+            >
+              {item.image_uri ? (
+                <Image source={{ uri: item.image_uri }} style={styles.resultImage} />
+              ) : (
+                <View style={[styles.resultImage, styles.placeholderImage]}>
+                  <Ionicons name="image-outline" size={24} color="#444" />
+                </View>
+              )}
+              <View style={styles.resultInfo}>
+                <View style={styles.nameRow}>
+                  <Text style={styles.resultName} numberOfLines={1}>
+                    {item.name}
+                  </Text>
+                  <ManaCost cost={item.mana_cost} />
+                </View>
+                <Text style={styles.resultType} numberOfLines={1}>
+                  {item.type_line}
+                </Text>
+                <Text style={styles.resultMeta} numberOfLines={1}>
+                  {item.set_name} ({item.set_code.toUpperCase()})
+                </Text>
+              </View>
+              <Ionicons name="chevron-forward" size={20} color="#444" />
+            </TouchableOpacity>
+          )}
+          ListEmptyComponent={
+            debouncedQuery ? (
+              <View style={styles.emptyState}>
+                <Text style={styles.emptyTitle}>No cards found</Text>
+                <Text style={styles.emptySubtitle}>Nothing matched "{debouncedQuery}".</Text>
+              </View>
+            ) : (
+              <View style={styles.emptyState}>
+                <Ionicons name="search-outline" size={48} color="#2a2a3e" />
+                <Text style={styles.emptyTitle}>Search for any Magic card</Text>
+                <Text style={styles.emptySubtitle}>Results from the full card database appear here.</Text>
+              </View>
+            )
+          }
+        />
       )}
 
-      {/* ── Card grid ── */}
-      <FlatList
-        data={listData}
-        keyExtractor={(item, index) =>
-          item.kind === 'header' ? `header-${item.title}` : `row-${index}`
-        }
-        contentContainerStyle={listData.length === 0 ? styles.emptyContent : styles.listContent}
-        refreshing={refreshing}
-        onRefresh={handleRefresh}
-        ListEmptyComponent={
-          cards.length === 0 ? (
-            <View style={styles.emptyState}>
-              <Text style={styles.emptyTitle}>No cards yet</Text>
-              <Text style={styles.emptySubtitle}>Scan your first card to start your collection.</Text>
-              <TouchableOpacity style={styles.scanCta} onPress={() => router.push('/(tabs)/scan')}>
-                <Text style={styles.scanCtaText}>Scan a Card</Text>
-              </TouchableOpacity>
-            </View>
-          ) : (
-            <View style={styles.emptyState}>
-              <Ionicons name="search-outline" size={40} color="#444" />
-              <Text style={styles.emptyTitle}>No matches</Text>
-              <Text style={styles.emptySubtitle}>Try a different name or color filter.</Text>
-            </View>
-          )
-        }
-        renderItem={({ item }) => {
-          if (item.kind === 'header') {
-            const isCollapsed = collapsedSections.has(item.title);
-            return (
-              <TouchableOpacity
-                style={styles.sectionHeader}
-                onPress={() => toggleSection(item.title)}
-                activeOpacity={0.7}
-              >
-                <Text style={styles.sectionHeaderText}>{item.title}</Text>
-                <View style={styles.sectionHeaderRight}>
-                  <Text style={styles.sectionHeaderCount}>{item.count}</Text>
-                  <Ionicons
-                    name={isCollapsed ? 'chevron-forward' : 'chevron-down'}
-                    size={14}
-                    color="#555"
-                  />
-                </View>
-              </TouchableOpacity>
-            );
-          }
-          return (
-            <View style={styles.row}>
-              {item.cards.map(card => (
-                <TouchableOpacity
-                  key={`${card.scryfall_id}-${card.pivot.foil}`}
-                  onPress={() => { setModalView('card'); setSelectedCard(card); }}
-                  activeOpacity={0.8}
-                >
-                  <CardItem card={card} />
-                </TouchableOpacity>
-              ))}
-              {/* spacer when odd card in row */}
-              {item.cards.length === 1 && <View style={{ width: CARD_WIDTH }} />}
-            </View>
-          );
-        }}
-      />
-
-      {/* ── Card Detail / Deck Picker modal ── */}
       <Modal
         visible={!!selectedCard}
         animationType="slide"
@@ -438,7 +641,7 @@ export default function CollectionScreen() {
       >
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
-            {selectedCard && modalView === 'card' && (
+            {selectedCard && modalView === 'card' ? (
               <>
                 <View style={styles.modalHeader}>
                   <Text style={styles.modalTitle} numberOfLines={1}>{selectedCard.name}</Text>
@@ -461,54 +664,87 @@ export default function CollectionScreen() {
                   )}
 
                   <View style={styles.modalInfo}>
+                    <View style={styles.modalMana}>
+                      <ManaCost cost={selectedCard.mana_cost} size={20} />
+                    </View>
                     <Text style={styles.modalType}>{selectedCard.type_line}</Text>
                     <Text style={styles.modalSet}>
                       {selectedCard.set_name} • {selectedCard.rarity}
                     </Text>
-                    {selectedCard.pivot.foil ? (
+                    {isCollectionCard(selectedCard) && selectedCard.pivot.foil ? (
                       <View style={styles.foilBadgeModal}>
                         <Text style={styles.foilBadgeText}>Foil</Text>
                       </View>
                     ) : null}
                   </View>
 
-                  {/* Quantity Controls */}
-                  <View style={styles.quantitySection}>
-                    <Text style={styles.quantityLabel}>Owned</Text>
-                    <View style={styles.quantityControls}>
+                  {isCollectionCard(selectedCard) ? (
+                    <>
+                      <View style={styles.quantitySection}>
+                        <Text style={styles.quantityLabel}>Owned</Text>
+                        <View style={styles.quantityControls}>
+                          <TouchableOpacity
+                            style={[styles.qtyButton, updatingCollection && styles.qtyButtonDisabled]}
+                            onPress={() => handleQuantityChange(-1)}
+                            disabled={updatingCollection}
+                          >
+                            <Ionicons name="remove" size={20} color="#fff" />
+                          </TouchableOpacity>
+                          <Text style={styles.quantityValue}>{selectedCard.pivot.quantity}</Text>
+                          <TouchableOpacity
+                            style={[styles.qtyButton, styles.qtyButtonAdd, updatingCollection && styles.qtyButtonDisabled]}
+                            onPress={() => handleQuantityChange(1)}
+                            disabled={updatingCollection}
+                          >
+                            <Ionicons name="add" size={20} color="#fff" />
+                          </TouchableOpacity>
+                        </View>
+                        {updatingCollection ? (
+                          <ActivityIndicator size="small" color="#6C3CE1" style={{ marginTop: 4 }} />
+                        ) : null}
+                      </View>
+
                       <TouchableOpacity
-                        style={[styles.qtyButton, updating && styles.qtyButtonDisabled]}
-                        onPress={() => handleQuantityChange(-1)}
-                        disabled={updating}
+                        style={styles.deckButton}
+                        onPress={handleOpenDeckPicker}
+                        disabled={updatingCollection || addingToDeck}
                       >
-                        <Ionicons name="remove" size={20} color="#fff" />
+                        <Ionicons name="albums" size={20} color="#fff" />
+                        <Text style={styles.deckButtonText}>Add to Deck</Text>
                       </TouchableOpacity>
-                      <Text style={styles.quantityValue}>{selectedCard.pivot.quantity}</Text>
+                    </>
+                  ) : (
+                    <View style={styles.actionButtons}>
                       <TouchableOpacity
-                        style={[styles.qtyButton, styles.qtyButtonAdd, updating && styles.qtyButtonDisabled]}
-                        onPress={() => handleQuantityChange(1)}
-                        disabled={updating}
+                        style={styles.actionButton}
+                        onPress={() => addToCollection(selectedCard)}
+                        disabled={updatingCollection}
                       >
-                        <Ionicons name="add" size={20} color="#fff" />
+                        {updatingCollection ? (
+                          <ActivityIndicator color="#fff" />
+                        ) : (
+                          <>
+                            <Ionicons name="library" size={20} color="#fff" />
+                            <Text style={styles.actionButtonText}>Collection</Text>
+                          </>
+                        )}
+                      </TouchableOpacity>
+
+                      <TouchableOpacity
+                        style={[styles.actionButton, styles.secondaryActionButton]}
+                        onPress={handleOpenDeckPicker}
+                        disabled={updatingCollection || addingToDeck}
+                      >
+                        <Ionicons name="albums" size={20} color="#fff" />
+                        <Text style={styles.actionButtonText}>Add to Deck</Text>
                       </TouchableOpacity>
                     </View>
-                    {updating && <ActivityIndicator size="small" color="#6C3CE1" style={{ marginTop: 4 }} />}
-                  </View>
-
-                  {/* Add to Deck */}
-                  <TouchableOpacity
-                    style={styles.deckButton}
-                    onPress={handleOpenDeckPicker}
-                    disabled={updating || addingToDeck}
-                  >
-                    <Ionicons name="albums" size={20} color="#fff" />
-                    <Text style={styles.deckButtonText}>Add to Deck</Text>
-                  </TouchableOpacity>
+                  )}
                 </ScrollView>
               </>
-            )}
+            ) : null}
 
-            {selectedCard && modalView === 'deck-picker' && (
+            {selectedCard && modalView === 'deck-picker' ? (
               <>
                 <View style={[styles.modalHeader, { paddingHorizontal: 20 }]}>
                   <TouchableOpacity style={styles.closeButton} onPress={() => setModalView('card')}>
@@ -538,7 +774,7 @@ export default function CollectionScreen() {
                 ) : (
                   <FlatList
                     data={decks}
-                    keyExtractor={(item) => item.id.toString()}
+                    keyExtractor={item => item.id.toString()}
                     renderItem={({ item }) => (
                       <TouchableOpacity
                         style={styles.deckSelectItem}
@@ -548,13 +784,14 @@ export default function CollectionScreen() {
                         <View>
                           <Text style={styles.deckSelectName}>{item.name}</Text>
                           <Text style={styles.deckSelectMeta}>
-                            {item.format ? item.format.toUpperCase() : 'CASUAL'} • {item.cards_count} cards
+                            {item.format ? item.format.toUpperCase() : 'CASUAL'} • {item.cards_sum_quantity} cards
                           </Text>
                         </View>
-                        {addingToDeck
-                          ? <ActivityIndicator size="small" color="#6C3CE1" />
-                          : <Ionicons name="add-circle" size={24} color="#6C3CE1" />
-                        }
+                        {addingToDeck ? (
+                          <ActivityIndicator size="small" color="#6C3CE1" />
+                        ) : (
+                          <Ionicons name="add-circle" size={24} color="#6C3CE1" />
+                        )}
                       </TouchableOpacity>
                     )}
                     contentContainerStyle={{ paddingHorizontal: 20 }}
@@ -562,7 +799,7 @@ export default function CollectionScreen() {
                   />
                 )}
               </>
-            )}
+            ) : null}
           </View>
         </View>
       </Modal>
@@ -598,9 +835,6 @@ function CardItem({ card }: { card: CollectionCard }) {
   );
 }
 
-const CARD_WIDTH = 160;
-const CARD_HEIGHT = 224;
-
 const styles = StyleSheet.create({
   container: {
     flex: 1,
@@ -611,9 +845,8 @@ const styles = StyleSheet.create({
     backgroundColor: '#0f0f1a',
     alignItems: 'center',
     justifyContent: 'center',
+    padding: 40,
   },
-
-  // ── Header ──
   headerRow: {
     flexDirection: 'row',
     alignItems: 'baseline',
@@ -632,8 +865,31 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '500',
   },
-
-  // ── Search ──
+  modeSwitcher: {
+    flexDirection: 'row',
+    backgroundColor: '#1a1a2e',
+    borderRadius: 10,
+    padding: 4,
+    marginHorizontal: 16,
+    marginBottom: 10,
+  },
+  modeButton: {
+    flex: 1,
+    paddingVertical: 8,
+    alignItems: 'center',
+    borderRadius: 8,
+  },
+  modeButtonActive: {
+    backgroundColor: '#6C3CE1',
+  },
+  modeButtonText: {
+    color: '#888',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  modeButtonTextActive: {
+    color: '#fff',
+  },
   searchBar: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -655,8 +911,6 @@ const styles = StyleSheet.create({
     fontSize: 14,
     paddingVertical: 0,
   },
-
-  // ── Color filter ──
   colorFilterScroll: {
     height: 48,
     flexGrow: 0,
@@ -701,8 +955,6 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
   },
-
-  // ── Section header ──
   sectionHeader: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -728,11 +980,12 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '600',
   },
-
-  // ── List ──
   listContent: {
     paddingHorizontal: 12,
     paddingBottom: 24,
+  },
+  searchListContent: {
+    paddingBottom: 20,
   },
   emptyContent: {
     flex: 1,
@@ -742,8 +995,6 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     marginBottom: 16,
   },
-
-  // ── Card item ──
   cardItem: {
     width: CARD_WIDTH,
     backgroundColor: '#1a1a2e',
@@ -807,8 +1058,53 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontWeight: '600',
   },
-
-  // ── Empty state ──
+  resultItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#1a1a2e',
+  },
+  resultImage: {
+    width: 50,
+    height: 70,
+    borderRadius: 4,
+    backgroundColor: '#1a1a2e',
+  },
+  placeholderImage: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  resultInfo: {
+    flex: 1,
+    marginLeft: 12,
+  },
+  nameRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 2,
+  },
+  resultName: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '600',
+    flex: 1,
+  },
+  manaCostContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginLeft: 8,
+  },
+  resultType: {
+    color: '#aaa',
+    fontSize: 12,
+    marginBottom: 2,
+  },
+  resultMeta: {
+    color: '#666',
+    fontSize: 11,
+  },
   emptyState: {
     flex: 1,
     alignItems: 'center',
@@ -821,6 +1117,7 @@ const styles = StyleSheet.create({
     fontSize: 20,
     fontWeight: '700',
     marginBottom: 8,
+    textAlign: 'center',
   },
   emptySubtitle: {
     color: '#888',
@@ -839,8 +1136,10 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     fontSize: 15,
   },
-
-  // ── Modal ──
+  errorText: {
+    color: '#ef4444',
+    textAlign: 'center',
+  },
   modalOverlay: {
     flex: 1,
     backgroundColor: 'rgba(0,0,0,0.85)',
@@ -897,6 +1196,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 24,
   },
+  modalMana: {
+    marginBottom: 8,
+  },
   modalType: {
     color: '#aaa',
     fontSize: 15,
@@ -921,8 +1223,6 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '600',
   },
-
-  // ── Quantity controls ──
   quantitySection: {
     alignItems: 'center',
     marginBottom: 20,
@@ -962,8 +1262,6 @@ const styles = StyleSheet.create({
     minWidth: 40,
     textAlign: 'center',
   },
-
-  // ── Deck button ──
   deckButton: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -979,8 +1277,30 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '600',
   },
-
-  // ── Deck picker ──
+  actionButtons: {
+    flexDirection: 'row',
+    gap: 12,
+    width: '100%',
+    paddingBottom: 20,
+  },
+  actionButton: {
+    flex: 1,
+    backgroundColor: '#6C3CE1',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 14,
+    borderRadius: 12,
+  },
+  secondaryActionButton: {
+    backgroundColor: '#2a2a3e',
+  },
+  actionButtonText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '600',
+    marginLeft: 8,
+  },
   deckSelectItem: {
     flexDirection: 'row',
     alignItems: 'center',

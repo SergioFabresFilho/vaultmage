@@ -176,6 +176,7 @@ class ScryfallService
             'legalities'       => $data['legalities'] ?? [],
             'type_line'        => $data['type_line'],
             'image_uri'        => $data['image_uris']['normal'] ?? $data['card_faces'][0]['image_uris']['normal'] ?? null,
+            'price_usd'        => isset($data['prices']['usd']) ? (float) $data['prices']['usd'] : null,
         ];
     }
 

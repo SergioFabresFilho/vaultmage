@@ -3,7 +3,9 @@ import {
   ActivityIndicator,
   Alert,
   FlatList,
+  Image,
   KeyboardAvoidingView,
+  Modal,
   Platform,
   ScrollView,
   StyleSheet,
@@ -44,6 +46,7 @@ type DeckProposal = {
   format: string | null;
   strategy_summary: string | null;
   cards: ProposalCard[];
+  draft_deck_id?: number | null;
 };
 
 type Message = {
@@ -75,11 +78,17 @@ function timeAgo(iso: string): string {
 function ProposalBubble({
   proposal,
   onCreateDeck,
+  onValidateDraft,
+  onDiscardDraft,
   creating,
+  onCardPress,
 }: {
   proposal: DeckProposal;
   onCreateDeck: (proposal: DeckProposal) => void;
+  onValidateDraft: (draftId: number) => void;
+  onDiscardDraft: (draftId: number) => void;
   creating: boolean;
+  onCardPress: (card: ProposalCard) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const visible = expanded ? proposal.cards : proposal.cards.slice(0, 6);
@@ -98,7 +107,19 @@ function ProposalBubble({
       <View style={styles.proposalDivider} />
 
       {visible.map((card) => (
-        <View key={card.card_id} style={styles.proposalCardRow}>
+        <TouchableOpacity
+          key={card.card_id != null ? String(card.card_id) : card.name}
+          style={styles.proposalCardRow}
+          onPress={() => onCardPress(card)}
+          activeOpacity={0.7}
+        >
+          {card.image_uri ? (
+            <Image source={{ uri: card.image_uri }} style={styles.proposalCardThumb} resizeMode="cover" />
+          ) : (
+            <View style={[styles.proposalCardThumb, styles.proposalCardThumbPlaceholder]}>
+              <Ionicons name="image-outline" size={14} color="#444" />
+            </View>
+          )}
           <View style={styles.proposalCardLeft}>
             <Text style={styles.proposalCardName}>{card.name ?? `Card #${card.card_id}`}</Text>
             <Text style={styles.proposalCardMeta}>
@@ -113,7 +134,7 @@ function ProposalBubble({
               {card.owned_quantity > 0 ? `own ${card.owned_quantity}` : 'not owned'}
             </Text>
           </View>
-        </View>
+        </TouchableOpacity>
       ))}
 
       {proposal.cards.length > 6 ? (
@@ -124,20 +145,47 @@ function ProposalBubble({
         </TouchableOpacity>
       ) : null}
 
-      <TouchableOpacity
-        style={[styles.createDeckBtn, creating && styles.buttonDisabled]}
-        onPress={() => onCreateDeck(proposal)}
-        disabled={creating}
-      >
-        {creating ? (
-          <ActivityIndicator color="#fff" size="small" />
-        ) : (
-          <>
-            <Ionicons name="albums" size={16} color="#fff" style={{ marginRight: 6 }} />
-            <Text style={styles.createDeckBtnText}>Create Deck</Text>
-          </>
-        )}
-      </TouchableOpacity>
+      {proposal.draft_deck_id != null ? (
+        <View style={styles.draftActionRow}>
+          <TouchableOpacity
+            style={[styles.validateDeckBtn, creating && styles.buttonDisabled]}
+            onPress={() => onValidateDraft(proposal.draft_deck_id!)}
+            disabled={creating}
+          >
+            {creating ? (
+              <ActivityIndicator color="#fff" size="small" />
+            ) : (
+              <>
+                <Ionicons name="checkmark-circle" size={16} color="#fff" style={{ marginRight: 6 }} />
+                <Text style={styles.createDeckBtnText}>Save to My Decks</Text>
+              </>
+            )}
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.discardDeckBtn, creating && styles.buttonDisabled]}
+            onPress={() => onDiscardDraft(proposal.draft_deck_id!)}
+            disabled={creating}
+          >
+            <Ionicons name="trash-outline" size={16} color="#f87171" style={{ marginRight: 6 }} />
+            <Text style={styles.discardDeckBtnText}>Discard</Text>
+          </TouchableOpacity>
+        </View>
+      ) : (
+        <TouchableOpacity
+          style={[styles.createDeckBtn, creating && styles.buttonDisabled]}
+          onPress={() => onCreateDeck(proposal)}
+          disabled={creating}
+        >
+          {creating ? (
+            <ActivityIndicator color="#fff" size="small" />
+          ) : (
+            <>
+              <Ionicons name="albums" size={16} color="#fff" style={{ marginRight: 6 }} />
+              <Text style={styles.createDeckBtnText}>Create Deck</Text>
+            </>
+          )}
+        </TouchableOpacity>
+      )}
     </View>
   );
 }
@@ -145,11 +193,17 @@ function ProposalBubble({
 function MessageBubble({
   message,
   onCreateDeck,
+  onValidateDraft,
+  onDiscardDraft,
   creating,
+  onCardPress,
 }: {
   message: Message;
   onCreateDeck: (proposal: DeckProposal) => void;
+  onValidateDraft: (draftId: number) => void;
+  onDiscardDraft: (draftId: number) => void;
   creating: boolean;
+  onCardPress: (card: ProposalCard) => void;
 }) {
   if (message.role === 'tool') return null;
 
@@ -172,7 +226,10 @@ function MessageBubble({
           <ProposalBubble
             proposal={message.metadata}
             onCreateDeck={onCreateDeck}
+            onValidateDraft={onValidateDraft}
+            onDiscardDraft={onDiscardDraft}
             creating={creating}
+            onCardPress={onCardPress}
           />
         ) : null}
       </View>
@@ -199,9 +256,15 @@ export default function AssistantScreen() {
   // Sending
   const [inputText, setInputText] = useState('');
   const [sending, setSending] = useState(false);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [thinkingLabel, setThinkingLabel] = useState('VaultMage is thinking…');
 
   // Deck creation
   const [creatingDeck, setCreatingDeck] = useState(false);
+  const creatingDeckRef = useRef(false);
+
+  // Card detail modal
+  const [selectedProposalCard, setSelectedProposalCard] = useState<ProposalCard | null>(null);
 
   const flatListRef = useRef<FlatList>(null);
 
@@ -274,8 +337,11 @@ export default function AssistantScreen() {
 
     setInputText('');
     setSending(true);
+    setIsStreaming(false);
+    setThinkingLabel('VaultMage is thinking…');
 
-    // Optimistic user bubble
+    const STREAMING_ID = -1;
+
     const tempUserMsg: Message = {
       id: Date.now(),
       role: 'user',
@@ -283,51 +349,114 @@ export default function AssistantScreen() {
       metadata: null,
       created_at: new Date().toISOString(),
     };
-    setMessages((prev) => [...prev, tempUserMsg]);
 
-    try {
-      const res = await fetch(
-        `${API_BASE_URL}/api/chat/conversations/${activeConversation.id}/messages`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Accept: 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify({ message: text }),
+    const streamingMsg: Message = {
+      id: STREAMING_ID,
+      role: 'assistant',
+      content: '',
+      metadata: null,
+      created_at: new Date().toISOString(),
+    };
+
+    setMessages((prev) => [...prev, tempUserMsg, streamingMsg]);
+
+    await new Promise<void>((resolve) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', `${API_BASE_URL}/api/chat/conversations/${activeConversation!.id}/messages/stream`);
+      xhr.setRequestHeader('Content-Type', 'application/json');
+      xhr.setRequestHeader('Accept', 'text/event-stream');
+      xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+
+      let processedLength = 0;
+      let sseBuffer = '';
+      let errorOccurred = false;
+
+      const toolLabels: Record<string, string> = {
+        get_collection:  'Checking your collection…',
+        get_decks:       'Loading your decks…',
+        search_cards:    'Searching cards…',
+        search_scryfall: 'Looking up Scryfall…',
+        propose_deck:    'Building deck proposal…',
+      };
+
+      function processLine(line: string) {
+        if (!line.startsWith('data: ')) return;
+        const raw = line.slice(6).trim();
+
+        let event: { type: string; text?: string; message_id?: number; deck_proposal?: DeckProposal | null; message?: string; round?: number; tools?: string[] };
+        try {
+          event = JSON.parse(raw);
+        } catch {
+          return;
         }
-      );
 
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.message || 'Failed to send message');
+        if (event.type === 'thinking') {
+          const firstTool = event.tools?.[0];
+          setThinkingLabel(firstTool ? (toolLabels[firstTool] ?? 'Working…') : 'Working…');
+        } else if (event.type === 'token') {
+          setIsStreaming(true);
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === STREAMING_ID
+                ? { ...m, content: (m.content ?? '') + (event.text ?? '') }
+                : m
+            )
+          );
+        } else if (event.type === 'done') {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === STREAMING_ID
+                ? { ...m, id: event.message_id!, metadata: event.deck_proposal ?? null }
+                : m
+            )
+          );
+          if (!activeConversation!.title) {
+            fetchConversations();
+            setActiveConversation((prev) =>
+              prev ? { ...prev, title: text.slice(0, 80) } : prev
+            );
+          }
+        } else if (event.type === 'error') {
+          errorOccurred = true;
+          setMessages((prev) => prev.filter((m) => m.id !== tempUserMsg.id && m.id !== STREAMING_ID));
+          Alert.alert('Error', event.message ?? 'Streaming error');
+        }
       }
 
-      const data = await res.json();
-      const assistantMsg: Message = data.message;
+      xhr.onprogress = () => {
+        const newChunk = xhr.responseText.slice(processedLength);
+        processedLength = xhr.responseText.length;
 
-      // If deck_proposal came back, attach it to the message metadata
-      if (data.deck_proposal && !assistantMsg.metadata) {
-        assistantMsg.metadata = data.deck_proposal;
-      }
+        sseBuffer += newChunk;
+        const lines = sseBuffer.split('\n');
+        sseBuffer = lines.pop() ?? '';
+        for (const line of lines) processLine(line);
+      };
 
-      setMessages((prev) => [...prev, assistantMsg]);
+      xhr.onload = () => {
+        // Flush any remaining buffered data
+        if (sseBuffer) processLine(sseBuffer);
 
-      // Update conversation title if it was auto-set
-      if (!activeConversation.title) {
-        fetchConversations();
-        setActiveConversation((prev) =>
-          prev ? { ...prev, title: text.slice(0, 80) } : prev
-        );
-      }
-    } catch (error) {
-      // Remove optimistic message on failure
-      setMessages((prev) => prev.filter((m) => m.id !== tempUserMsg.id));
-      Alert.alert('Error', error instanceof Error ? error.message : 'Failed to send message.');
-    } finally {
-      setSending(false);
-    }
+        if (!errorOccurred && xhr.status >= 400) {
+          setMessages((prev) => prev.filter((m) => m.id !== tempUserMsg.id && m.id !== STREAMING_ID));
+          Alert.alert('Error', 'Failed to send message.');
+        }
+
+        setSending(false);
+        setIsStreaming(false);
+        resolve();
+      };
+
+      xhr.onerror = () => {
+        setMessages((prev) => prev.filter((m) => m.id !== tempUserMsg.id && m.id !== STREAMING_ID));
+        Alert.alert('Error', 'Network error. Please try again.');
+        setSending(false);
+        setIsStreaming(false);
+        resolve();
+      };
+
+      xhr.send(JSON.stringify({ message: text }));
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -335,7 +464,8 @@ export default function AssistantScreen() {
   // -------------------------------------------------------------------------
 
   async function handleCreateDeck(proposal: DeckProposal) {
-    if (!activeConversation) return;
+    if (!activeConversation || creatingDeckRef.current) return;
+    creatingDeckRef.current = true;
     setCreatingDeck(true);
 
     try {
@@ -352,7 +482,9 @@ export default function AssistantScreen() {
             deck_name: proposal.deck_name,
             format: proposal.format,
             strategy_summary: proposal.strategy_summary,
-            cards: proposal.cards.map((c) => ({ card_id: c.card_id, quantity: c.quantity })),
+            cards: proposal.cards
+              .filter((c) => c.card_id && c.quantity >= 1)
+              .map((c) => ({ card_id: c.card_id, quantity: c.quantity })),
           }),
         }
       );
@@ -366,8 +498,58 @@ export default function AssistantScreen() {
     } catch (error) {
       Alert.alert('Error', error instanceof Error ? error.message : 'Failed to create deck.');
     } finally {
+      creatingDeckRef.current = false;
       setCreatingDeck(false);
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Draft deck actions
+  // -------------------------------------------------------------------------
+
+  async function handleValidateDraft(draftId: number) {
+    if (creatingDeckRef.current) return;
+    creatingDeckRef.current = true;
+    setCreatingDeck(true);
+
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/decks/${draftId}/validate`, {
+        method: 'POST',
+        headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.message || 'Failed to save deck');
+      }
+
+      Alert.alert('Deck saved!', 'Your draft has been added to My Decks.');
+    } catch (error) {
+      Alert.alert('Error', error instanceof Error ? error.message : 'Failed to save deck.');
+    } finally {
+      creatingDeckRef.current = false;
+      setCreatingDeck(false);
+    }
+  }
+
+  async function handleDiscardDraft(draftId: number) {
+    Alert.alert('Discard draft?', 'This deck will be permanently deleted.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Discard',
+        style: 'destructive',
+        onPress: async () => {
+          try {
+            await fetch(`${API_BASE_URL}/api/decks/${draftId}`, {
+              method: 'DELETE',
+              headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
+            });
+          } catch {
+            Alert.alert('Error', 'Could not discard the draft.');
+          }
+        },
+      },
+    ]);
   }
 
   // -------------------------------------------------------------------------
@@ -483,19 +665,100 @@ export default function AssistantScreen() {
             <MessageBubble
               message={item}
               onCreateDeck={handleCreateDeck}
+              onValidateDraft={handleValidateDraft}
+              onDiscardDraft={handleDiscardDraft}
               creating={creatingDeck}
+              onCardPress={setSelectedProposalCard}
             />
           )}
         />
       )}
 
-      {/* Thinking indicator */}
-      {sending ? (
+      {/* Thinking indicator — shown while waiting for first token */}
+      {sending && !isStreaming ? (
         <View style={styles.thinkingRow}>
           <ActivityIndicator size="small" color="#6C3CE1" style={{ marginRight: 8 }} />
-          <Text style={styles.thinkingText}>VaultMage is thinking…</Text>
+          <Text style={styles.thinkingText}>{thinkingLabel}</Text>
         </View>
       ) : null}
+
+      {/* Card detail modal */}
+      <Modal
+        visible={!!selectedProposalCard}
+        animationType="slide"
+        transparent={true}
+        onRequestClose={() => setSelectedProposalCard(null)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            {selectedProposalCard && (
+              <>
+                <View style={styles.modalHeader}>
+                  <Text style={styles.modalTitle} numberOfLines={1}>
+                    {selectedProposalCard.name ?? `Card #${selectedProposalCard.card_id}`}
+                  </Text>
+                  <TouchableOpacity style={styles.modalCloseBtn} onPress={() => setSelectedProposalCard(null)}>
+                    <Ionicons name="close" size={24} color="#fff" />
+                  </TouchableOpacity>
+                </View>
+
+                <ScrollView contentContainerStyle={styles.modalScroll}>
+                  {selectedProposalCard.image_uri ? (
+                    <Image
+                      source={{ uri: selectedProposalCard.image_uri }}
+                      style={styles.modalCardImage}
+                      resizeMode="contain"
+                    />
+                  ) : (
+                    <View style={[styles.modalCardImage, styles.modalCardImagePlaceholder]}>
+                      <Ionicons name="image-outline" size={48} color="#444" />
+                    </View>
+                  )}
+
+                  <View style={styles.modalCardInfo}>
+                    {selectedProposalCard.type_line ? (
+                      <Text style={styles.modalCardType}>{selectedProposalCard.type_line}</Text>
+                    ) : null}
+                    {selectedProposalCard.mana_cost ? (
+                      <Text style={styles.modalCardMana}>{selectedProposalCard.mana_cost}</Text>
+                    ) : null}
+
+                    <View style={styles.modalCardBadgeRow}>
+                      <View style={styles.modalCardQtyBadge}>
+                        <Text style={styles.modalCardQtyText}>×{selectedProposalCard.quantity} in deck</Text>
+                      </View>
+                      <View style={[
+                        styles.modalCardOwnedBadge,
+                        selectedProposalCard.owned_quantity > 0 ? styles.ownedBadgeYes : styles.ownedBadgeNo,
+                      ]}>
+                        <Text style={styles.modalCardOwnedText}>
+                          {selectedProposalCard.owned_quantity > 0
+                            ? `You own ${selectedProposalCard.owned_quantity}`
+                            : 'Not in collection'}
+                        </Text>
+                      </View>
+                    </View>
+
+                    {selectedProposalCard.role ? (
+                      <View style={styles.modalCardSection}>
+                        <Text style={styles.modalCardSectionLabel}>Role</Text>
+                        <Text style={styles.modalCardSectionText}>{selectedProposalCard.role}</Text>
+                      </View>
+                    ) : null}
+
+                    {selectedProposalCard.reason ? (
+                      <View style={styles.modalCardSection}>
+                        <Text style={styles.modalCardSectionLabel}>Why this card</Text>
+                        <Text style={styles.modalCardSectionText}>{selectedProposalCard.reason}</Text>
+                      </View>
+                    ) : null}
+                  </View>
+                </ScrollView>
+              </>
+            )}
+          </View>
+        </View>
+      </Modal>
 
       {/* Input bar */}
       <View style={styles.inputBar}>
@@ -640,6 +903,125 @@ const styles = StyleSheet.create({
   bubbleTextUser: { color: '#fff' },
   bubbleTextAssistant: { color: '#e8e0f0' },
 
+  // Card thumbnail in proposal row
+  proposalCardThumb: {
+    width: 36,
+    height: 50,
+    borderRadius: 4,
+    marginRight: 10,
+    overflow: 'hidden',
+  },
+  proposalCardThumbPlaceholder: {
+    backgroundColor: '#1e1e30',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+
+  // Card detail modal
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    justifyContent: 'flex-end',
+  },
+  modalContent: {
+    backgroundColor: '#1a1a2e',
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    maxHeight: '85%',
+    paddingBottom: 32,
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+    paddingVertical: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#2a2a3e',
+  },
+  modalTitle: {
+    flex: 1,
+    color: '#fff',
+    fontSize: 17,
+    fontWeight: '700',
+  },
+  modalCloseBtn: {
+    padding: 4,
+    marginLeft: 8,
+  },
+  modalScroll: {
+    paddingBottom: 16,
+  },
+  modalCardImage: {
+    width: '55%',
+    aspectRatio: 0.71,
+    borderRadius: 12,
+    alignSelf: 'center',
+    marginVertical: 16,
+  },
+  modalCardImagePlaceholder: {
+    backgroundColor: '#0f0f1a',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modalCardInfo: {
+    paddingHorizontal: 20,
+    gap: 8,
+  },
+  modalCardType: {
+    color: '#aaa',
+    fontSize: 14,
+  },
+  modalCardMana: {
+    color: '#c8a0ff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  modalCardBadgeRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 4,
+    flexWrap: 'wrap',
+  },
+  modalCardQtyBadge: {
+    backgroundColor: '#2a2a3e',
+    borderRadius: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  modalCardQtyText: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  modalCardOwnedBadge: {
+    borderRadius: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  ownedBadgeYes: { backgroundColor: '#14532d' },
+  ownedBadgeNo: { backgroundColor: '#450a0a' },
+  modalCardOwnedText: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  modalCardSection: {
+    marginTop: 8,
+  },
+  modalCardSectionLabel: {
+    color: '#6C3CE1',
+    fontSize: 11,
+    fontWeight: '700',
+    letterSpacing: 0.6,
+    textTransform: 'uppercase',
+    marginBottom: 4,
+  },
+  modalCardSectionText: {
+    color: '#ccc',
+    fontSize: 14,
+    lineHeight: 20,
+  },
+
   // Proposal card
   proposalCard: {
     backgroundColor: '#0f0f1a',
@@ -683,6 +1065,27 @@ const styles = StyleSheet.create({
   },
   createDeckBtnText: { color: '#fff', fontWeight: '700', fontSize: 15 },
   buttonDisabled: { opacity: 0.55 },
+  draftActionRow: { flexDirection: 'row', gap: 8, marginTop: 12 },
+  validateDeckBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#166534',
+    borderRadius: 10,
+    paddingVertical: 12,
+  },
+  discardDeckBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 10,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderWidth: 1,
+    borderColor: '#f87171',
+  },
+  discardDeckBtnText: { color: '#f87171', fontWeight: '600', fontSize: 14 },
 
   // Thinking
   thinkingRow: {

@@ -58,4 +58,31 @@ class DeckModelTest extends TestCase
         $this->assertEquals(3, $pivot->quantity);
         $this->assertTrue((bool) $pivot->is_sideboard);
     }
+
+    public function test_is_draft_defaults_to_false()
+    {
+        $user = User::factory()->create();
+
+        $deck = Deck::create([
+            'user_id' => $user->id,
+            'name'    => 'Test Deck',
+        ]);
+
+        $this->assertFalse((bool) $deck->fresh()->is_draft);
+    }
+
+    public function test_is_draft_can_be_set_to_true()
+    {
+        $deck = Deck::factory()->create(['is_draft' => true]);
+
+        $this->assertTrue($deck->is_draft);
+    }
+
+    public function test_is_draft_is_cast_to_boolean()
+    {
+        $deck = Deck::factory()->create(['is_draft' => true]);
+        $fresh = $deck->fresh();
+
+        $this->assertIsBool($fresh->is_draft);
+    }
 }

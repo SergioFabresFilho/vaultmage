@@ -40,7 +40,7 @@ class DeckTest extends TestCase
 
         $response = $this->actingAs($this->user)->getJson('/api/decks');
 
-        $response->assertStatus(200)->assertJsonPath('0.cards_count', 1);
+        $response->assertStatus(200)->assertJsonPath('0.cards_sum_quantity', 1);
     }
 
     public function test_it_creates_a_deck()
@@ -239,6 +239,70 @@ class DeckTest extends TestCase
     public function test_unauthenticated_users_cannot_access_decks()
     {
         $response = $this->getJson('/api/decks');
+
+        $response->assertStatus(401);
+    }
+
+    // -------------------------------------------------------------------------
+    // Draft deck tests
+    // -------------------------------------------------------------------------
+
+    public function test_validate_promotes_draft_deck_to_real_deck()
+    {
+        $deck = Deck::factory()->create(['user_id' => $this->user->id, 'is_draft' => true]);
+
+        $response = $this->actingAs($this->user)->postJson("/api/decks/{$deck->id}/validate");
+
+        $response->assertStatus(200)->assertJsonPath('is_draft', false);
+        $this->assertDatabaseHas('decks', ['id' => $deck->id, 'is_draft' => false]);
+    }
+
+    public function test_validate_returns_403_for_other_users_draft()
+    {
+        $deck = Deck::factory()->create(['is_draft' => true]);
+
+        $response = $this->actingAs($this->user)->postJson("/api/decks/{$deck->id}/validate");
+
+        $response->assertStatus(403);
+    }
+
+    public function test_validate_also_works_on_non_draft_deck()
+    {
+        $deck = Deck::factory()->create(['user_id' => $this->user->id, 'is_draft' => false]);
+
+        $response = $this->actingAs($this->user)->postJson("/api/decks/{$deck->id}/validate");
+
+        $response->assertStatus(200)->assertJsonPath('is_draft', false);
+    }
+
+    public function test_draft_deck_is_returned_in_index()
+    {
+        Deck::factory()->create(['user_id' => $this->user->id, 'is_draft' => false]);
+        Deck::factory()->create(['user_id' => $this->user->id, 'is_draft' => true]);
+
+        $response = $this->actingAs($this->user)->getJson('/api/decks');
+
+        $response->assertStatus(200)->assertJsonCount(2);
+        $isDrafts = collect($response->json())->pluck('is_draft');
+        $this->assertContains(true, $isDrafts);
+        $this->assertContains(false, $isDrafts);
+    }
+
+    public function test_draft_deck_can_be_deleted()
+    {
+        $deck = Deck::factory()->create(['user_id' => $this->user->id, 'is_draft' => true]);
+
+        $response = $this->actingAs($this->user)->deleteJson("/api/decks/{$deck->id}");
+
+        $response->assertStatus(204);
+        $this->assertDatabaseMissing('decks', ['id' => $deck->id]);
+    }
+
+    public function test_unauthenticated_users_cannot_validate_deck()
+    {
+        $deck = Deck::factory()->create(['is_draft' => true]);
+
+        $response = $this->postJson("/api/decks/{$deck->id}/validate");
 
         $response->assertStatus(401);
     }

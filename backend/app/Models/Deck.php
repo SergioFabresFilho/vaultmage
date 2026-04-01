@@ -17,6 +17,13 @@ class Deck extends Model
         'name',
         'format',
         'description',
+        'color_identity',
+        'is_draft',
+    ];
+
+    protected $casts = [
+        'color_identity' => 'array',
+        'is_draft'       => 'boolean',
     ];
 
     public function user(): BelongsTo

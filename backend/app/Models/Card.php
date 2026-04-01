@@ -24,13 +24,21 @@ class Card extends Model
         'legalities',
         'type_line',
         'image_uri',
+        'price_usd',
     ];
 
     protected $casts = [
-        'cmc' => 'float',
+        'cmc'            => 'float',
+        'price_usd'      => 'float',
         'color_identity' => 'array',
-        'legalities' => 'array',
+        'legalities'     => 'array',
     ];
+
+    public function decks(): BelongsToMany
+    {
+        return $this->belongsToMany(Deck::class, 'deck_cards')
+            ->withPivot(['quantity', 'is_sideboard']);
+    }
 
     public function collectors(): BelongsToMany
     {

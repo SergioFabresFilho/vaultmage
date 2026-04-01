@@ -41,7 +41,7 @@ type Deck = {
   id: number;
   name: string;
   format: string | null;
-  cards_count: number;
+  cards_sum_quantity: number;
 };
 
 type SearchMode = 'all' | 'collection';
@@ -420,7 +420,7 @@ export default function SearchScreen() {
                       <View>
                         <Text style={styles.deckSelectName}>{item.name}</Text>
                         <Text style={styles.deckSelectMeta}>
-                          {item.format ? item.format.toUpperCase() : 'CASUAL'} • {item.cards_count} cards
+                          {item.format ? item.format.toUpperCase() : 'CASUAL'} • {item.cards_sum_quantity} cards
                         </Text>
                       </View>
                       <Ionicons name="add-circle" size={24} color="#6C3CE1" />

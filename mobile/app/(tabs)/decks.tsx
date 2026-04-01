@@ -4,6 +4,7 @@ import {
   Alert,
   FlatList,
   Modal,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
@@ -11,6 +12,7 @@ import {
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { useRouter } from 'expo-router';
 import { useAuth } from '@/context/AuthContext';
 
 const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:8000';
@@ -28,12 +30,24 @@ const FORMATS = [
   { label: 'Casual', value: 'casual' },
 ];
 
+const COLORS = [
+  { symbol: 'W', label: 'White', bg: '#f9faf4', text: '#333' },
+  { symbol: 'U', label: 'Blue',  bg: '#0e68ab', text: '#fff' },
+  { symbol: 'B', label: 'Black', bg: '#2a2a2a', text: '#fff' },
+  { symbol: 'R', label: 'Red',   bg: '#d3202a', text: '#fff' },
+  { symbol: 'G', label: 'Green', bg: '#00733e', text: '#fff' },
+];
+
 type Deck = {
   id: number;
   name: string;
   format: string | null;
   description: string | null;
-  cards_count: number;
+  color_identity: string[] | null;
+  cards_sum_quantity: number;
+  total_price: number | null;
+  missing_price: number | null;
+  is_draft: boolean;
 };
 
 function formatLabel(value: string | null) {
@@ -41,8 +55,26 @@ function formatLabel(value: string | null) {
   return FORMATS.find((f) => f.value === value)?.label ?? value.toUpperCase();
 }
 
+function ColorPips({ colors }: { colors: string[] | null }) {
+  if (!colors || colors.length === 0) return null;
+  return (
+    <View style={styles.colorPips}>
+      {colors.map((c) => {
+        const def = COLORS.find((x) => x.symbol === c);
+        if (!def) return null;
+        return (
+          <View key={c} style={[styles.colorPip, { backgroundColor: def.bg }]}>
+            <Text style={[styles.colorPipText, { color: def.text }]}>{c}</Text>
+          </View>
+        );
+      })}
+    </View>
+  );
+}
+
 export default function DecksScreen() {
   const { token } = useAuth();
+  const router = useRouter();
   const [decks, setDecks] = useState<Deck[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -50,6 +82,7 @@ export default function DecksScreen() {
   const [modalVisible, setModalVisible] = useState(false);
   const [deckName, setDeckName] = useState('');
   const [deckFormat, setDeckFormat] = useState('edh');
+  const [deckColors, setDeckColors] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
 
   const fetchDecks = useCallback(async () => {
@@ -74,6 +107,18 @@ export default function DecksScreen() {
     setRefreshing(false);
   }
 
+  function toggleColor(symbol: string) {
+    setDeckColors((prev) =>
+      prev.includes(symbol) ? prev.filter((c) => c !== symbol) : [...prev, symbol]
+    );
+  }
+
+  function resetModal() {
+    setDeckName('');
+    setDeckFormat('edh');
+    setDeckColors([]);
+  }
+
   async function handleCreate() {
     if (!deckName.trim()) {
       Alert.alert('Error', 'Please enter a deck name.');
@@ -89,7 +134,11 @@ export default function DecksScreen() {
           Accept: 'application/json',
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ name: deckName.trim(), format: deckFormat }),
+        body: JSON.stringify({
+          name: deckName.trim(),
+          format: deckFormat,
+          color_identity: deckColors.length > 0 ? deckColors : null,
+        }),
       });
 
       if (!res.ok) {
@@ -98,8 +147,7 @@ export default function DecksScreen() {
       }
 
       setModalVisible(false);
-      setDeckName('');
-      setDeckFormat('edh');
+      resetModal();
       fetchDecks();
     } catch (error) {
       Alert.alert('Error', error instanceof Error ? error.message : 'Failed to create deck.');
@@ -146,16 +194,34 @@ export default function DecksScreen() {
         renderItem={({ item }) => (
           <TouchableOpacity
             style={styles.deckItem}
-            onPress={() => Alert.alert(item.name, `${formatLabel(item.format)} • ${item.cards_count} cards`)}
+            onPress={() => router.push(`/deck/${item.id}`)}
           >
             <View style={styles.deckIcon}>
               <Ionicons name="layers" size={24} color="#ffb36b" />
             </View>
             <View style={styles.deckInfo}>
-              <Text style={styles.deckName}>{item.name}</Text>
-              <Text style={styles.deckMeta}>
-                {formatLabel(item.format)} • {item.cards_count} cards
-              </Text>
+              <View style={styles.deckNameRow}>
+                <Text style={styles.deckName}>{item.name}</Text>
+                {item.is_draft && (
+                  <View style={styles.draftBadge}>
+                    <Text style={styles.draftBadgeText}>DRAFT</Text>
+                  </View>
+                )}
+              </View>
+              <View style={styles.deckMetaRow}>
+                <Text style={styles.deckMeta}>
+                  {formatLabel(item.format)} • {item.cards_sum_quantity} cards
+                </Text>
+                <ColorPips colors={item.color_identity} />
+              </View>
+              {item.total_price != null && (
+                <View style={styles.deckPriceRow}>
+                  <Text style={styles.deckPriceTotal}>${item.total_price.toFixed(2)}</Text>
+                  {item.missing_price != null && item.missing_price > 0 && (
+                    <Text style={styles.deckPriceMissing}> · ${item.missing_price.toFixed(2)} to buy</Text>
+                  )}
+                </View>
+              )}
             </View>
             <Ionicons name="chevron-forward" size={20} color="#8a7d8f" />
           </TouchableOpacity>
@@ -166,52 +232,80 @@ export default function DecksScreen() {
         animationType="slide"
         transparent
         visible={modalVisible}
-        onRequestClose={() => setModalVisible(false)}
+        onRequestClose={() => { setModalVisible(false); resetModal(); }}
       >
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>Create Deck</Text>
-              <TouchableOpacity onPress={() => setModalVisible(false)}>
-                <Ionicons name="close" size={24} color="#f1e6dc" />
-              </TouchableOpacity>
-            </View>
-
-            <Text style={styles.label}>Deck Name</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="Ex: Sultai Graveyard"
-              placeholderTextColor="#85756a"
-              value={deckName}
-              onChangeText={setDeckName}
-            />
-
-            <Text style={styles.label}>Format</Text>
-            <View style={styles.chipGrid}>
-              {FORMATS.map((format) => (
-                <TouchableOpacity
-                  key={format.value}
-                  style={[styles.chip, deckFormat === format.value && styles.chipSelected]}
-                  onPress={() => setDeckFormat(format.value)}
-                >
-                  <Text style={[styles.chipText, deckFormat === format.value && styles.chipTextSelected]}>
-                    {format.label}
-                  </Text>
+            <ScrollView showsVerticalScrollIndicator={false}>
+              <View style={styles.modalHeader}>
+                <Text style={styles.modalTitle}>Create Deck</Text>
+                <TouchableOpacity onPress={() => { setModalVisible(false); resetModal(); }}>
+                  <Ionicons name="close" size={24} color="#f1e6dc" />
                 </TouchableOpacity>
-              ))}
-            </View>
+              </View>
 
-            <TouchableOpacity
-              style={[styles.primaryButton, submitting && styles.buttonDisabled]}
-              onPress={handleCreate}
-              disabled={submitting}
-            >
-              {submitting ? (
-                <ActivityIndicator color="#fff" size="small" />
-              ) : (
-                <Text style={styles.primaryButtonText}>Create Deck</Text>
+              <Text style={styles.label}>Deck Name</Text>
+              <TextInput
+                style={styles.input}
+                placeholder="Ex: Sultai Graveyard"
+                placeholderTextColor="#85756a"
+                value={deckName}
+                onChangeText={setDeckName}
+              />
+
+              <Text style={styles.label}>Format</Text>
+              <View style={styles.chipGrid}>
+                {FORMATS.map((format) => (
+                  <TouchableOpacity
+                    key={format.value}
+                    style={[styles.chip, deckFormat === format.value && styles.chipSelected]}
+                    onPress={() => setDeckFormat(format.value)}
+                  >
+                    <Text style={[styles.chipText, deckFormat === format.value && styles.chipTextSelected]}>
+                      {format.label}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              <Text style={styles.label}>Color Identity <Text style={styles.labelHint}>(optional — enforces card validation)</Text></Text>
+              <View style={styles.colorRow}>
+                {COLORS.map((color) => {
+                  const selected = deckColors.includes(color.symbol);
+                  return (
+                    <TouchableOpacity
+                      key={color.symbol}
+                      style={[
+                        styles.colorButton,
+                        { backgroundColor: color.bg },
+                        selected && styles.colorButtonSelected,
+                        !selected && styles.colorButtonUnselected,
+                      ]}
+                      onPress={() => toggleColor(color.symbol)}
+                    >
+                      <Text style={[styles.colorButtonText, { color: color.text }]}>{color.symbol}</Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+              {deckColors.length > 0 && (
+                <Text style={styles.colorHint}>
+                  Cards outside {deckColors.join('')} identity will be rejected.
+                </Text>
               )}
-            </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[styles.primaryButton, submitting && styles.buttonDisabled]}
+                onPress={handleCreate}
+                disabled={submitting}
+              >
+                {submitting ? (
+                  <ActivityIndicator color="#fff" size="small" />
+                ) : (
+                  <Text style={styles.primaryButtonText}>Create Deck</Text>
+                )}
+              </TouchableOpacity>
+            </ScrollView>
           </View>
         </View>
       </Modal>
@@ -280,8 +374,24 @@ const styles = StyleSheet.create({
     marginRight: 16,
   },
   deckInfo: { flex: 1 },
-  deckName: { color: '#fff', fontSize: 16, fontWeight: '600', marginBottom: 4 },
+  deckNameRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 4 },
+  deckName: { color: '#fff', fontSize: 16, fontWeight: '600' },
+  draftBadge: { backgroundColor: '#7c3c0a', borderRadius: 4, paddingHorizontal: 6, paddingVertical: 2 },
+  draftBadgeText: { color: '#fbbf24', fontSize: 10, fontWeight: '700', letterSpacing: 0.5 },
+  deckMetaRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   deckMeta: { color: '#888', fontSize: 13 },
+  deckPriceRow: { flexDirection: 'row', alignItems: 'center', marginTop: 3 },
+  deckPriceTotal: { color: '#7dcea0', fontSize: 12, fontWeight: '600' },
+  deckPriceMissing: { color: '#e8975a', fontSize: 12 },
+  colorPips: { flexDirection: 'row', gap: 3 },
+  colorPip: {
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  colorPipText: { fontSize: 9, fontWeight: '800' },
   modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.8)', justifyContent: 'flex-end' },
   modalContent: {
     backgroundColor: '#1a1a2e',
@@ -289,6 +399,7 @@ const styles = StyleSheet.create({
     borderTopRightRadius: 24,
     padding: 24,
     paddingBottom: 40,
+    maxHeight: '90%',
   },
   modalHeader: {
     flexDirection: 'row',
@@ -306,6 +417,7 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
     letterSpacing: 0.4,
   },
+  labelHint: { color: '#555', fontSize: 11, fontWeight: '400', textTransform: 'none' },
   input: {
     backgroundColor: '#0f0f1a',
     borderRadius: 12,
@@ -327,6 +439,20 @@ const styles = StyleSheet.create({
   chipSelected: { backgroundColor: '#6C3CE1', borderColor: '#6C3CE1' },
   chipText: { color: '#888', fontSize: 13, fontWeight: '600' },
   chipTextSelected: { color: '#fff' },
+  colorRow: { flexDirection: 'row', gap: 10, marginTop: 4 },
+  colorButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 2,
+    borderColor: 'transparent',
+  },
+  colorButtonSelected: { borderColor: '#fff', transform: [{ scale: 1.1 }] },
+  colorButtonUnselected: { opacity: 0.45 },
+  colorButtonText: { fontSize: 15, fontWeight: '800' },
+  colorHint: { color: '#6C3CE1', fontSize: 12, marginTop: 8 },
   primaryButton: {
     backgroundColor: '#6C3CE1',
     borderRadius: 12,

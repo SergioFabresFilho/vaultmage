@@ -8,6 +8,7 @@ use App\Models\Deck;
 use App\Services\AiChatService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class ChatController extends Controller
 {
@@ -63,6 +64,59 @@ class ChatController extends Controller
         ]);
     }
 
+    // POST /api/chat/conversations/{conversation}/messages/stream
+    public function streamMessage(Request $request, Conversation $conversation): StreamedResponse
+    {
+        $this->authorizeConversation($request, $conversation);
+
+        $request->validate(['message' => 'required|string|max:2000']);
+
+        $user    = $request->user();
+        $message = $request->input('message');
+
+        return response()->stream(function () use ($conversation, $user, $message) {
+            // Disable output buffering so chunks reach the client immediately
+            while (ob_get_level() > 0) {
+                ob_end_clean();
+            }
+
+            // Allow long-running deck builds (multiple tool rounds + Scryfall lookups)
+            set_time_limit(0);
+
+            // Send an initial heartbeat immediately so the client doesn't time out
+            // before the first OpenAI response arrives.
+            echo 'data: ' . json_encode(['type' => 'thinking', 'round' => 0, 'tools' => []]) . "\n\n";
+            flush();
+
+            $this->chatService->chatStream(
+                $conversation,
+                $user,
+                $message,
+                function (string $type, mixed $data) {
+                    if ($type === 'token') {
+                        echo 'data: ' . json_encode(['type' => 'token', 'text' => $data]) . "\n\n";
+                    } elseif ($type === 'thinking') {
+                        echo 'data: ' . json_encode(['type' => 'thinking', 'round' => $data['round'], 'tools' => $data['tools']]) . "\n\n";
+                    } elseif ($type === 'done') {
+                        echo 'data: ' . json_encode([
+                            'type'          => 'done',
+                            'message_id'    => $data['message_id'],
+                            'deck_proposal' => $data['deck_proposal'],
+                        ]) . "\n\n";
+                    } elseif ($type === 'error') {
+                        echo 'data: ' . json_encode(['type' => 'error', 'message' => $data]) . "\n\n";
+                    }
+                    flush();
+                }
+            );
+        }, 200, [
+            'Content-Type'      => 'text/event-stream',
+            'Cache-Control'     => 'no-cache',
+            'X-Accel-Buffering' => 'no',
+            'Connection'        => 'keep-alive',
+        ]);
+    }
+
     // POST /api/chat/conversations/{conversation}/create-deck
     public function createDeck(Request $request, Conversation $conversation): JsonResponse
     {
@@ -92,7 +146,7 @@ class ChatController extends Controller
 
         $deck->cards()->sync($syncData);
 
-        return response()->json($deck->loadCount('cards'), 201);
+        return response()->json($deck, 201);
     }
 
     // -------------------------------------------------------------------------

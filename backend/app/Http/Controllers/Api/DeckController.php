@@ -15,7 +15,42 @@ class DeckController extends Controller
      */
     public function index()
     {
-        return Auth::user()->decks()->withCount('cards')->latest()->get();
+        $user = Auth::user();
+
+        $decks = $user->decks()
+            ->withSum('cards as cards_sum_quantity', 'deck_cards.quantity')
+            ->latest()
+            ->get();
+
+        // Compute price totals per deck in one query
+        // total_price  = sum(price_usd * quantity) for all cards in deck
+        // missing_price = sum(price_usd * quantity) for cards the user does NOT own
+        $deckIds = $decks->pluck('id');
+
+        $totals = \Illuminate\Support\Facades\DB::table('deck_cards')
+            ->join('cards', 'deck_cards.card_id', '=', 'cards.id')
+            ->whereIn('deck_cards.deck_id', $deckIds)
+            ->whereNotNull('cards.price_usd')
+            ->selectRaw('
+                deck_cards.deck_id,
+                SUM(cards.price_usd * deck_cards.quantity) as total_price,
+                SUM(CASE WHEN collection.quantity IS NULL OR collection.quantity = 0
+                         THEN cards.price_usd * deck_cards.quantity ELSE 0 END) as missing_price
+            ')
+            ->leftJoin(
+                \Illuminate\Support\Facades\DB::raw('(SELECT card_id, quantity FROM collection_cards WHERE user_id = ' . $user->id . ') AS collection'),
+                'cards.id', '=', 'collection.card_id'
+            )
+            ->groupBy('deck_cards.deck_id')
+            ->get()
+            ->keyBy('deck_id');
+
+        return $decks->map(function ($deck) use ($totals) {
+            $t = $totals->get($deck->id);
+            $deck->total_price   = $t ? round((float) $t->total_price, 2) : null;
+            $deck->missing_price = $t ? round((float) $t->missing_price, 2) : null;
+            return $deck;
+        });
     }
 
     /**
@@ -27,6 +62,8 @@ class DeckController extends Controller
             'name' => 'required|string|max:255',
             'format' => 'nullable|string|in:standard,modern,pioneer,legacy,vintage,commander,edh,brawl,pauper,casual',
             'description' => 'nullable|string',
+            'color_identity' => 'nullable|array',
+            'color_identity.*' => 'string|in:W,U,B,R,G',
         ]);
 
         $deck = Auth::user()->decks()->create($validated);
@@ -44,7 +81,10 @@ class DeckController extends Controller
         }
 
         return $deck->load(['cards' => function ($query) {
-            $query->withPivot('quantity', 'is_sideboard');
+            $query->withPivot('quantity', 'is_sideboard')
+                  ->select('cards.id', 'cards.name', 'cards.type_line', 'cards.mana_cost',
+                           'cards.image_uri', 'cards.color_identity', 'cards.rarity',
+                           'cards.cmc', 'cards.price_usd');
         }]);
     }
 
@@ -61,6 +101,8 @@ class DeckController extends Controller
             'name' => 'required|string|max:255',
             'format' => 'nullable|string|in:standard,modern,pioneer,legacy,vintage,commander,edh,brawl,pauper,casual',
             'description' => 'nullable|string',
+            'color_identity' => 'nullable|array',
+            'color_identity.*' => 'string|in:W,U,B,R,G',
         ]);
 
         $deck->update($validated);
@@ -97,6 +139,26 @@ class DeckController extends Controller
             'quantity' => 'required|integer|min:1',
             'is_sideboard' => 'boolean',
         ]);
+
+        // Color identity validation: skip if deck has no color identity set
+        $deckColors = $deck->color_identity ?? [];
+        if (!empty($deckColors)) {
+            $cardToCheck = null;
+            if (!empty($validated['card_id'])) {
+                $cardToCheck = \App\Models\Card::find($validated['card_id']);
+            } elseif (!empty($validated['scryfall_id'])) {
+                $cardToCheck = \App\Models\Card::where('scryfall_id', $validated['scryfall_id'])->first();
+            }
+
+            if ($cardToCheck && !empty($cardToCheck->color_identity)) {
+                $offendingColors = array_diff($cardToCheck->color_identity, $deckColors);
+                if (!empty($offendingColors)) {
+                    return response()->json([
+                        'message' => "Color identity mismatch: {$cardToCheck->name} contains " . implode(', ', $offendingColors) . " which is outside the deck's color identity.",
+                    ], 422);
+                }
+            }
+        }
 
         $cardId = $validated['card_id'] ?? null;
 
@@ -143,6 +205,20 @@ class DeckController extends Controller
         ]);
 
         return response()->json(['message' => 'Card added successfully']);
+    }
+
+    /**
+     * Promote a draft deck to a real deck.
+     */
+    public function validate(Deck $deck)
+    {
+        if ($deck->user_id !== Auth::id()) {
+            abort(403);
+        }
+
+        $deck->update(['is_draft' => false]);
+
+        return response()->json($deck);
     }
 
     /**
