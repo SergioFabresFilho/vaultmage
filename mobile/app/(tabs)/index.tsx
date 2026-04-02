@@ -32,6 +32,7 @@ type BaseCard = {
   rarity: string;
   type_line: string;
   mana_cost: string | null;
+  price_usd: number | null;
   color_identity?: string[];
   image_uri: string | null;
 };
@@ -810,25 +811,30 @@ export default function CollectionScreen() {
 function CardItem({ card }: { card: CollectionCard }) {
   return (
     <View style={styles.cardItem}>
-      {card.image_uri ? (
-        <Image source={{ uri: card.image_uri }} style={styles.cardImage} resizeMode="cover" />
-      ) : (
-        <View style={styles.cardImagePlaceholder}>
-          <Text style={styles.cardImagePlaceholderText}>{card.name}</Text>
-        </View>
-      )}
-      <View style={styles.cardInfo}>
-        <Text style={styles.cardName} numberOfLines={1}>{card.name}</Text>
-        <Text style={styles.cardMeta} numberOfLines={1}>{card.set_name}</Text>
-        <View style={styles.cardBadges}>
-          <View style={styles.quantityBadge}>
-            <Text style={styles.quantityText}>{`\u00D7${card.pivot.quantity}`}</Text>
+      <View style={styles.cardImageContainer}>
+        {card.image_uri ? (
+          <Image source={{ uri: card.image_uri }} style={styles.cardImage} resizeMode="cover" />
+        ) : (
+          <View style={styles.cardImagePlaceholder}>
+            <Text style={styles.cardImagePlaceholderText}>{card.name}</Text>
           </View>
-          {card.pivot.foil ? (
-            <View style={styles.foilBadge}>
-              <Text style={styles.foilText}>Foil</Text>
-            </View>
-          ) : null}
+        )}
+        <View style={styles.cardQtyBadge}>
+          <Text style={styles.cardQtyText}>{`\u00D7${card.pivot.quantity}`}</Text>
+        </View>
+        {card.price_usd != null ? (
+          <Text style={styles.cardPriceOverlay}>${card.price_usd.toFixed(2)}</Text>
+        ) : null}
+        {card.pivot.foil ? (
+          <View style={styles.foilBadge}>
+            <Text style={styles.foilText}>Foil</Text>
+          </View>
+        ) : null}
+      </View>
+      <View style={styles.cardInfo}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+          <Text style={[styles.cardName, { flex: 1 }]} numberOfLines={1}>{card.name}</Text>
+          {card.mana_cost ? <ManaCost cost={card.mana_cost} size={13} /> : null}
         </View>
       </View>
     </View>
@@ -1001,6 +1007,9 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     overflow: 'hidden',
   },
+  cardImageContainer: {
+    position: 'relative',
+  },
   cardImage: {
     width: CARD_WIDTH,
     height: CARD_HEIGHT,
@@ -1018,37 +1027,38 @@ const styles = StyleSheet.create({
     fontSize: 12,
     textAlign: 'center',
   },
-  cardInfo: {
-    padding: 8,
-  },
-  cardName: {
-    color: '#fff',
-    fontSize: 13,
-    fontWeight: '600',
-    marginBottom: 2,
-  },
-  cardMeta: {
-    color: '#888',
-    fontSize: 11,
-    marginBottom: 6,
-  },
-  cardBadges: {
-    flexDirection: 'row',
-    gap: 6,
-  },
-  quantityBadge: {
-    backgroundColor: '#2a2a3e',
+  cardQtyBadge: {
+    position: 'absolute',
+    top: 6,
+    left: 6,
+    backgroundColor: 'rgba(0,0,0,0.7)',
     paddingHorizontal: 6,
     paddingVertical: 2,
     borderRadius: 4,
   },
-  quantityText: {
-    color: '#ccc',
+  cardQtyText: {
+    color: '#fff',
     fontSize: 11,
-    fontWeight: '600',
+    fontWeight: '700',
+  },
+  cardPriceOverlay: {
+    position: 'absolute',
+    bottom: 6,
+    right: 6,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    color: '#7dcea0',
+    fontSize: 11,
+    fontWeight: '700',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+    overflow: 'hidden',
   },
   foilBadge: {
-    backgroundColor: '#3d2a6e',
+    position: 'absolute',
+    top: 6,
+    right: 6,
+    backgroundColor: 'rgba(61,42,110,0.85)',
     paddingHorizontal: 6,
     paddingVertical: 2,
     borderRadius: 4,
@@ -1057,6 +1067,15 @@ const styles = StyleSheet.create({
     color: '#a78bfa',
     fontSize: 11,
     fontWeight: '600',
+  },
+  cardInfo: {
+    padding: 8,
+  },
+  cardName: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '600',
+    marginBottom: 4,
   },
   resultItem: {
     flexDirection: 'row',

@@ -338,12 +338,14 @@ export default function DeckViewScreen() {
                   {item.type_line}
                 </Text>
               </View>
-              {item.mana_cost ? (
-                <ManaCost cost={item.mana_cost} size={16} />
-              ) : null}
-              {item.price_usd != null && (
-                <Text style={styles.cardPrice}>${(item.price_usd * item.pivot.quantity).toFixed(2)}</Text>
-              )}
+              <View style={{ alignItems: 'flex-end' }}>
+                {item.mana_cost ? (
+                  <ManaCost cost={item.mana_cost} size={16} />
+                ) : null}
+                {item.price_usd != null && (
+                  <Text style={styles.cardPrice}>${(item.price_usd * item.pivot.quantity).toFixed(2)}</Text>
+                )}
+              </View>
               <Ionicons name="chevron-forward" size={16} color="#555" style={styles.rowChevron} />
             </TouchableOpacity>
           )}
