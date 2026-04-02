@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
 set -e
 
-# Promote ./backend to repo root for Laravel Cloud deployment
-echo "Promoting ./backend to root..."
+# Step 1: Create a temporary directory
+mkdir /tmp/monorepo_tmp
 
-# Move all backend contents to root (excluding already-copied composer files)
-cp -rn backend/. .
+# Step 2: Move subdirectories out of the deployment root
+repos=("backend" "mobile")
+for item in "${repos[@]}"; do
+  mv "$item" /tmp/monorepo_tmp/
+done
 
-# Remove the now-redundant backend directory
-rm -rf backend/ mobile/
+# Step 3: Promote the Laravel app into the deployment root
+cp -Rf /tmp/monorepo_tmp/backend/. .
 
-echo "Done. Running Laravel build..."
+# Step 4: Clean up
+rm -rf /tmp/monorepo_tmp
+
+# Step 5: Build
+composer install --no-dev --no-interaction --prefer-dist --optimize-autoloader
+npm install
+npm run build
