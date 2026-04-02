@@ -1,3 +1,4 @@
+import { API_BASE_URL } from '@/lib/api';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
@@ -19,7 +20,6 @@ import { Ionicons } from '@expo/vector-icons';
 import { SvgUri } from 'react-native-svg';
 import { useAuth } from '@/context/AuthContext';
 
-const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:8000';
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
 type BaseCard = {

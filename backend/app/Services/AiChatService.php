@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Jobs\FetchCommanderAverageDeck;
 use App\Models\Card;
 use App\Models\Conversation;
 use App\Models\Deck;
@@ -14,8 +15,11 @@ use Illuminate\Support\Facades\Log;
 
 class AiChatService
 {
-    private const MAX_TOOL_ROUNDS_BUILD = 10;
+    private const MAX_TOOL_ROUNDS_BUILD = 16;
+    private const MAX_DISCOVERY_ROUNDS_BUILD = 12;
+    private const MAX_REPAIR_ROUNDS_PER_PROPOSAL = 5;
     private const MAX_TOOL_ROUNDS_IMPROVEMENT = 6;
+    private const MAX_IDENTICAL_SEARCH_REPEATS = 2;
 
     private string $apiKey;
     private string $model;
@@ -58,11 +62,52 @@ class AiChatService
         $tools    = $this->toolDefinitions();
         $proposal = null;
         $maxToolRounds = $this->maxToolRoundsForConversation($conversation);
+        $loopState = $this->initializeBuildContext($conversation, $this->initialLoopState(), $userText);
 
         $toolRounds = 0;
 
         while (true) {
-            $response = $this->callOpenAi($history, $tools);
+            if ($this->hasExceededRoundBudget($conversation, $loopState, $toolRounds, $maxToolRounds)) {
+                Log::warning('AiChatService: MAX_TOOL_ROUNDS reached', [
+                    'conversation_id' => $conversation->id,
+                    'rounds'          => $toolRounds,
+                    'max_rounds'      => $maxToolRounds,
+                    'discovery_rounds'=> $loopState['discovery_rounds'] ?? null,
+                    'repair_rounds'   => $loopState['repair_rounds_used'] ?? null,
+                    'in_repair'       => $loopState['in_repair'] ?? null,
+                ]);
+
+                if ($fallback = $this->buildMaxRoundsFallbackMessage($conversation, $loopState)) {
+                    $proposal = $this->finalizeFallbackProposal($proposal, $loopState, $user, $conversation);
+                    $assistantMsg = $conversation->messages()->create([
+                        'role'     => 'assistant',
+                        'content'  => $fallback,
+                        'metadata' => $proposal,
+                    ]);
+
+                    return ['message' => $assistantMsg, 'deck_proposal' => $proposal];
+                }
+
+                abort(502, "AI exceeded the maximum number of tool-call rounds ({$maxToolRounds}).");
+            }
+
+            try {
+                $response = $this->callOpenAi($history, $tools);
+            } catch (\Throwable $e) {
+                Log::warning('AiChatService: OpenAI call failed', [
+                    'conversation_id' => $conversation->id,
+                    'error' => $e->getMessage(),
+                ]);
+
+                $proposal = $this->finalizeFallbackProposal($proposal, $loopState, $user, $conversation);
+                $assistantMsg = $conversation->messages()->create([
+                    'role'     => 'assistant',
+                    'content'  => $this->openAiFailureMessage($conversation),
+                    'metadata' => $proposal,
+                ]);
+
+                return ['message' => $assistantMsg, 'deck_proposal' => $proposal];
+            }
             $choice   = $response['choices'][0] ?? null;
 
             if (! $choice) {
@@ -75,6 +120,7 @@ class AiChatService
             if (empty($toolCalls)) {
                 // Final text response — always allowed regardless of round count
                 $text = $msg['content'] ?? '';
+                $proposal = $this->finalizeFallbackProposal($proposal, $loopState, $user, $conversation);
                 $assistantMsg = $conversation->messages()->create([
                     'role'     => 'assistant',
                     'content'  => $text,
@@ -84,16 +130,8 @@ class AiChatService
                 return ['message' => $assistantMsg, 'deck_proposal' => $proposal];
             }
 
-            if ($toolRounds >= $maxToolRounds) {
-                Log::warning('AiChatService: MAX_TOOL_ROUNDS reached', [
-                    'conversation_id' => $conversation->id,
-                    'rounds'          => $toolRounds,
-                    'max_rounds'      => $maxToolRounds,
-                ]);
-                abort(502, "AI exceeded the maximum number of tool-call rounds ({$maxToolRounds}).");
-            }
-
             $toolRounds++;
+            $loopState = $this->consumeRoundBudget($conversation, $loopState);
 
             $toolNames = array_map(fn ($tc) => $tc['function']['name'], $toolCalls);
             Log::debug('AiChatService: tool round', [
@@ -116,6 +154,7 @@ class AiChatService
             foreach ($toolCalls as $call) {
                 $fnName = $call['function']['name'];
                 $args   = json_decode($call['function']['arguments'] ?? '{}', true) ?? [];
+                $args   = $this->normalizeToolArgs($conversation, $loopState, $fnName, $args);
 
                 Log::debug('AiChatService: executing tool', [
                     'conversation_id' => $conversation->id,
@@ -124,7 +163,18 @@ class AiChatService
                     'args'            => $args,
                 ]);
 
-                $result = $this->executeTool($call, $user, $conversation);
+                $blockedResult = $this->blockedRepairToolResult($conversation, $loopState, $fnName);
+                $cachedResult = $blockedResult ?? $this->cachedToolResult($conversation, $loopState, $fnName, $args);
+                if ($cachedResult !== null) {
+                    $result = $cachedResult;
+                    Log::debug($blockedResult !== null ? 'AiChatService: blocking repair-mode tool' : 'AiChatService: reusing cached tool result', [
+                        'conversation_id' => $conversation->id,
+                        'round' => $toolRounds,
+                        'tool' => $fnName,
+                    ]);
+                } else {
+                    $result = $this->executeTool($fnName, $args, $user, $conversation);
+                }
 
                 if (in_array($fnName, ['propose_deck', 'propose_changes'], true) && isset($result['proposal'])) {
                     $proposal = $result['proposal'];
@@ -157,6 +207,18 @@ class AiChatService
                 ]);
 
                 $history[] = ['role' => 'tool', 'tool_call_id' => $call['id'], 'content' => $toolOutput];
+
+                $loopState = $this->recordLoopState($loopState, $fnName, $args, $result);
+                if ($fallback = $this->buildLoopFallbackMessage($conversation, $loopState)) {
+                    $proposal = $this->finalizeFallbackProposal($proposal, $loopState, $user, $conversation);
+                    $assistantMsg = $conversation->messages()->create([
+                        'role'     => 'assistant',
+                        'content'  => $fallback,
+                        'metadata' => $proposal,
+                    ]);
+
+                    return ['message' => $assistantMsg, 'deck_proposal' => $proposal];
+                }
             }
         }
     }
@@ -193,18 +255,71 @@ class AiChatService
         $tools    = $this->toolDefinitions();
         $proposal = null;
         $maxToolRounds = $this->maxToolRoundsForConversation($conversation);
+        $loopState = $this->initializeBuildContext($conversation, $this->initialLoopState(), $userText);
 
         $toolRounds = 0;
 
         while (true) {
-            ['text' => $text, 'tool_calls' => $toolCalls] = $this->callOpenAiStreamIter(
-                $history,
-                $tools,
-                fn (string $token) => $emit('token', $token)
-            );
+            if ($this->hasExceededRoundBudget($conversation, $loopState, $toolRounds, $maxToolRounds)) {
+                Log::warning('AiChatService: MAX_TOOL_ROUNDS reached (stream)', [
+                    'conversation_id' => $conversation->id,
+                    'rounds'          => $toolRounds,
+                    'max_rounds'      => $maxToolRounds,
+                    'discovery_rounds'=> $loopState['discovery_rounds'] ?? null,
+                    'repair_rounds'   => $loopState['repair_rounds_used'] ?? null,
+                    'in_repair'       => $loopState['in_repair'] ?? null,
+                ]);
+
+                if ($fallback = $this->buildMaxRoundsFallbackMessage($conversation, $loopState)) {
+                    $proposal = $this->finalizeFallbackProposal($proposal, $loopState, $user, $conversation);
+                    $assistantMsg = $conversation->messages()->create([
+                        'role'     => 'assistant',
+                        'content'  => $fallback,
+                        'metadata' => $proposal,
+                    ]);
+
+                    $emit('done', [
+                        'message_id'    => $assistantMsg->id,
+                        'content'       => $assistantMsg->content,
+                        'deck_proposal' => $proposal,
+                    ]);
+                    return;
+                }
+
+                $emit('error', "AI exceeded the maximum number of tool-call rounds ({$maxToolRounds}).");
+                return;
+            }
+
+            try {
+                ['text' => $text, 'tool_calls' => $toolCalls] = $this->callOpenAiStreamIter(
+                    $history,
+                    $tools,
+                    fn (string $token) => $emit('token', $token)
+                );
+            } catch (\Throwable $e) {
+                Log::warning('AiChatService: OpenAI stream call failed', [
+                    'conversation_id' => $conversation->id,
+                    'error' => $e->getMessage(),
+                ]);
+
+                $proposal = $this->finalizeFallbackProposal($proposal, $loopState, $user, $conversation);
+                $assistantMsg = $conversation->messages()->create([
+                    'role'     => 'assistant',
+                    'content'  => $this->openAiFailureMessage($conversation),
+                    'metadata' => $proposal,
+                ]);
+
+                $emit('done', [
+                    'message_id'    => $assistantMsg->id,
+                    'content'       => $assistantMsg->content,
+                    'deck_proposal' => $proposal,
+                ]);
+                return;
+            }
 
             if (empty($toolCalls)) {
                 // Final text round — tokens already emitted, persist and signal done
+                $proposal = $this->finalizeFallbackProposal($proposal, $loopState, $user, $conversation);
                 $assistantMsg = $conversation->messages()->create([
                     'role'     => 'assistant',
                     'content'  => $text,
@@ -213,22 +328,14 @@ class AiChatService
 
                 $emit('done', [
                     'message_id'    => $assistantMsg->id,
+                    'content'       => $assistantMsg->content,
                     'deck_proposal' => $proposal,
                 ]);
                 return;
             }
 
-            if ($toolRounds >= $maxToolRounds) {
-                Log::warning('AiChatService: MAX_TOOL_ROUNDS reached (stream)', [
-                    'conversation_id' => $conversation->id,
-                    'rounds'          => $toolRounds,
-                    'max_rounds'      => $maxToolRounds,
-                ]);
-                $emit('error', "AI exceeded the maximum number of tool-call rounds ({$maxToolRounds}).");
-                return;
-            }
-
             $toolRounds++;
+            $loopState = $this->consumeRoundBudget($conversation, $loopState);
 
             $toolNames = array_map(fn ($tc) => $tc['function']['name'], $toolCalls);
             Log::debug('AiChatService: tool round (stream)', [
@@ -251,6 +358,7 @@ class AiChatService
             foreach ($toolCalls as $call) {
                 $fnName = $call['function']['name'];
                 $args   = json_decode($call['function']['arguments'] ?? '{}', true) ?? [];
+                $args   = $this->normalizeToolArgs($conversation, $loopState, $fnName, $args);
 
                 Log::debug('AiChatService: executing tool (stream)', [
                     'conversation_id' => $conversation->id,
@@ -259,7 +367,18 @@ class AiChatService
                     'args'            => $args,
                 ]);
 
-                $result = $this->executeTool($call, $user, $conversation);
+                $blockedResult = $this->blockedRepairToolResult($conversation, $loopState, $fnName);
+                $cachedResult = $blockedResult ?? $this->cachedToolResult($conversation, $loopState, $fnName, $args);
+                if ($cachedResult !== null) {
+                    $result = $cachedResult;
+                    Log::debug($blockedResult !== null ? 'AiChatService: blocking repair-mode tool (stream)' : 'AiChatService: reusing cached tool result (stream)', [
+                        'conversation_id' => $conversation->id,
+                        'round' => $toolRounds,
+                        'tool' => $fnName,
+                    ]);
+                } else {
+                    $result = $this->executeTool($fnName, $args, $user, $conversation);
+                }
 
                 if (in_array($fnName, ['propose_deck', 'propose_changes'], true) && isset($result['proposal'])) {
                     $proposal    = $result['proposal'];
@@ -292,6 +411,23 @@ class AiChatService
                 ]);
 
                 $history[] = ['role' => 'tool', 'tool_call_id' => $call['id'], 'content' => $toolOutput];
+
+                $loopState = $this->recordLoopState($loopState, $fnName, $args, $result);
+                if ($fallback = $this->buildLoopFallbackMessage($conversation, $loopState)) {
+                    $proposal = $this->finalizeFallbackProposal($proposal, $loopState, $user, $conversation);
+                    $assistantMsg = $conversation->messages()->create([
+                        'role'     => 'assistant',
+                        'content'  => $fallback,
+                        'metadata' => $proposal,
+                    ]);
+
+                    $emit('done', [
+                        'message_id'    => $assistantMsg->id,
+                        'content'       => $assistantMsg->content,
+                        'deck_proposal' => $proposal,
+                    ]);
+                    return;
+                }
             }
         }
     }
@@ -456,15 +592,338 @@ class AiChatService
             : self::MAX_TOOL_ROUNDS_BUILD;
     }
 
+    private function initialLoopState(): array
+    {
+        return [
+            'last_search_signature'       => null,
+            'identical_search_repeats'    => 0,
+            'search_rounds'               => 0,
+            'discovery_rounds'            => 0,
+            'repair_rounds_used'          => 0,
+            'in_repair'                   => false,
+            'consecutive_proposal_errors' => 0,
+            'proposal_attempts'           => 0,
+            'last_candidate'             => null,
+            'last_shortage'               => null,
+            'last_format'                 => null,
+            'last_error'                  => null,
+            'build_search_colors'         => [],
+            'build_commander_name'        => null,
+            'last_collection_signature'   => null,
+            'last_collection_result'      => null,
+        ];
+    }
+
+    private function initializeBuildContext(Conversation $conversation, array $state, string $userText): array
+    {
+        if ($conversation->deck_id) {
+            // For improvement sessions, lock search colors to the attached deck's color identity
+            // so search tools never return off-color cards.
+            $deck = \App\Models\Deck::find($conversation->deck_id);
+            if ($deck && ! empty($deck->color_identity)) {
+                $state['build_search_colors'] = $this->normalizeColorCodes(array_values($deck->color_identity));
+            }
+            return $state;
+        }
+
+        $state['build_search_colors'] = $this->extractSearchColorsFromText($userText);
+        $state['build_commander_name'] = $this->extractCommanderNameFromText($userText);
+
+        if ($state['build_search_colors'] === [] && is_string($state['build_commander_name'])) {
+            $state['build_search_colors'] = $this->resolveCommanderColorIdentity($state['build_commander_name']);
+        }
+
+        return $state;
+    }
+
+    private function recordLoopState(array $state, string $toolName, array $args, array $result): array
+    {
+        if ($toolName === 'propose_deck') {
+            $state['proposal_attempts']++;
+            if (isset($result['draft_candidate'])) {
+                $state['last_candidate'] = $result['draft_candidate'];
+            }
+
+            // Lock build_search_colors to the declared color_identity so any
+            // subsequent searches (e.g. after a rejection) are always color-filtered.
+            $declaredColors = array_values(array_filter(
+                array_map('strtoupper', $args['color_identity'] ?? []),
+                fn ($c) => in_array($c, ['W', 'U', 'B', 'R', 'G'], true)
+            ));
+            if ($declaredColors !== [] && $state['build_search_colors'] === []) {
+                $state['build_search_colors'] = $declaredColors;
+            }
+
+            $error = $result['error'] ?? null;
+            if (is_string($error) && str_starts_with($error, 'Deck rejected:')) {
+                $state['consecutive_proposal_errors']++;
+                $state['last_error'] = $error;
+                $state['last_shortage'] = $this->extractShortageFromProposalError($error);
+                $state['last_format'] = $args['format'] ?? $state['last_format'];
+                $state['in_repair'] = true;
+                $state['repair_rounds_used'] = 0;
+            } else {
+                $state['consecutive_proposal_errors'] = 0;
+                $state['last_error'] = null;
+                $state['last_shortage'] = null;
+                $state['last_format'] = $args['format'] ?? $state['last_format'];
+                $state['in_repair'] = false;
+                $state['repair_rounds_used'] = 0;
+            }
+
+            return $state;
+        }
+
+        if ($toolName === 'get_commander_guide') {
+            $commanderColors = array_values(array_filter($result['commander']['color_identity'] ?? [], fn ($color) => is_string($color) && $color !== ''));
+            if ($commanderColors !== []) {
+                $state['build_search_colors'] = $commanderColors;
+            }
+            if (! empty($args['commander_name'])) {
+                $state['build_commander_name'] = $args['commander_name'];
+            }
+
+            return $state;
+        }
+
+        if ($toolName === 'get_collection') {
+            $state['last_collection_signature'] = json_encode($args);
+            $state['last_collection_result'] = $result;
+        }
+
+        if (in_array($toolName, ['get_collection', 'search_cards', 'search_scryfall'], true)) {
+            $state['search_rounds']++;
+            $signature = json_encode([$toolName, $args]);
+            if ($signature === $state['last_search_signature']) {
+                $state['identical_search_repeats']++;
+            } else {
+                $state['last_search_signature'] = $signature;
+                $state['identical_search_repeats'] = 1;
+            }
+
+            return $state;
+        }
+
+        return $state;
+    }
+
+    private function buildLoopFallbackMessage(Conversation $conversation, array $state): ?string
+    {
+        if ($conversation->deck_id) {
+            return null;
+        }
+
+        if ($state['consecutive_proposal_errors'] < 2) {
+            return null;
+        }
+
+        if (($state['identical_search_repeats'] ?? 0) < self::MAX_IDENTICAL_SEARCH_REPEATS) {
+            return null;
+        }
+
+        $format = $state['last_format'] ?: 'this format';
+        $shortage = $state['last_shortage'];
+        $shortageText = is_int($shortage)
+            ? " It is still {$shortage} card(s) short of a legal list."
+            : '';
+
+        return "I’m pausing here because the deck builder is looping on the same search and not converging on a legal {$format} deck.{$shortageText} The next attempt will be more reliable if you narrow it a bit: ask for a core package first, add must-include cards, or tell me to use only cards you own plus a short buy list.";
+    }
+
+    private function buildMaxRoundsFallbackMessage(Conversation $conversation, array $state): ?string
+    {
+        if ($conversation->deck_id) {
+            return null;
+        }
+
+        $format = $state['last_format'] ?: 'commander';
+        $shortage = $state['last_shortage'];
+        $shortageText = is_int($shortage)
+            ? " The last legal check still had the deck {$shortage} card(s) short."
+            : '';
+
+        if (($state['in_repair'] ?? false) === true) {
+            return "I stopped before wasting more tool calls. The deck builder found a draft for {$format} but used the repair budget trying to fix validation issues.{$shortageText} The next attempt will be more reliable if you give must-include cards, a stricter budget, or ask for the core package first.";
+        }
+
+        if (($state['search_rounds'] ?? 0) >= 5 && ($state['proposal_attempts'] ?? 0) <= 1) {
+            return "I stopped before wasting more tool calls. The deck builder spent too many rounds searching instead of locking a final {$format} list.{$shortageText} A more reliable next step is to ask for a tight version first, like a 25-card core package plus lands/ramp ratios, then expand from there.";
+        }
+
+        if (($state['proposal_attempts'] ?? 0) >= 1) {
+            return "I stopped before wasting more tool calls. The deck builder did not converge on a legal {$format} list within the round limit.{$shortageText} The next attempt will be more reliable if you give must-include cards, a stricter budget, or ask for the core package first.";
+        }
+
+        return "I stopped before wasting more tool calls. The deck builder used the round budget gathering candidates for a new {$format} build and needs a narrower target. Ask for a core package first, a lower budget build, or a list that uses only cards you own.";
+    }
+
+    private function cachedToolResult(Conversation $conversation, array $loopState, string $toolName, array $args): ?array
+    {
+        if ($conversation->deck_id || $toolName !== 'get_collection') {
+            return null;
+        }
+
+        $signature = json_encode($args);
+        if ($signature === false || $signature !== ($loopState['last_collection_signature'] ?? null)) {
+            return null;
+        }
+
+        $cached = $loopState['last_collection_result'] ?? null;
+
+        return is_array($cached) ? $cached : null;
+    }
+
+    private function openAiFailureMessage(Conversation $conversation): string
+    {
+        if ($conversation->deck_id) {
+            return 'The assistant hit an upstream AI timeout while working on this deck. Try again.';
+        }
+
+        return 'The deck builder hit an upstream AI timeout before it could finish. Try again; if it hangs again, ask for a tighter first pass like a core package.';
+    }
+
+    private function materializeDraftCandidate(array $candidate, User $user, Conversation $conversation): array
+    {
+        $draft = Deck::create([
+            'user_id'     => $user->id,
+            'name'        => $candidate['deck_name'] ?? 'New Deck',
+            'format'      => $candidate['format'] ?? null,
+            'description' => $candidate['strategy_summary'] ?? null,
+            'is_draft'    => true,
+        ]);
+
+        $syncData = collect($candidate['cards'] ?? [])
+            ->filter(fn ($c) => ! empty($c['card_id']))
+            ->mapWithKeys(fn ($c) => [$c['card_id'] => ['quantity' => $c['quantity'], 'is_sideboard' => false]])
+            ->all();
+
+        if ($syncData !== []) {
+            $draft->cards()->sync($syncData);
+        }
+
+        $changes = $this->buildProposalChanges($conversation, $candidate['cards'] ?? [], $user);
+
+        return [
+            'proposal_type'     => 'deck',
+            'deck_name'         => $candidate['deck_name'] ?? 'New Deck',
+            'format'            => $candidate['format'] ?? null,
+            'strategy_summary'  => $candidate['strategy_summary'] ?? null,
+            'cards'             => $candidate['cards'] ?? [],
+            'added_cards'       => $changes['added_cards'],
+            'removed_cards'     => $changes['removed_cards'],
+            'draft_deck_id'     => $draft->id,
+            'validation_message'=> $candidate['validation_message'] ?? null,
+        ];
+    }
+
+    private function finalizeFallbackProposal(?array $proposal, array $loopState, User $user, Conversation $conversation): ?array
+    {
+        if ($proposal !== null) {
+            return $proposal;
+        }
+
+        $candidate = $loopState['last_candidate'] ?? null;
+        if (! is_array($candidate) || empty($candidate['cards'])) {
+            return null;
+        }
+
+        if (! empty($candidate['validation_message'])) {
+            return [
+                'proposal_type'      => 'deck',
+                'deck_name'          => $candidate['deck_name'] ?? 'New Deck',
+                'format'             => $candidate['format'] ?? null,
+                'strategy_summary'   => $candidate['strategy_summary'] ?? null,
+                'cards'              => $candidate['cards'] ?? [],
+                'added_cards'        => [],
+                'removed_cards'      => [],
+                'draft_deck_id'      => null,
+                'validation_message' => $candidate['validation_message'],
+            ];
+        }
+
+        return $this->materializeDraftCandidate($candidate, $user, $conversation);
+    }
+
+    private function hasExceededRoundBudget(Conversation $conversation, array $loopState, int $toolRounds, int $maxToolRounds): bool
+    {
+        if ($conversation->deck_id) {
+            return $toolRounds >= $maxToolRounds;
+        }
+
+        if ($toolRounds >= $maxToolRounds) {
+            return true;
+        }
+
+        if (($loopState['in_repair'] ?? false) === true) {
+            return ($loopState['repair_rounds_used'] ?? 0) >= self::MAX_REPAIR_ROUNDS_PER_PROPOSAL;
+        }
+
+        return ($loopState['discovery_rounds'] ?? 0) >= self::MAX_DISCOVERY_ROUNDS_BUILD;
+    }
+
+    private function consumeRoundBudget(Conversation $conversation, array $loopState): array
+    {
+        if ($conversation->deck_id) {
+            return $loopState;
+        }
+
+        if (($loopState['in_repair'] ?? false) === true) {
+            $loopState['repair_rounds_used'] = ($loopState['repair_rounds_used'] ?? 0) + 1;
+            return $loopState;
+        }
+
+        $loopState['discovery_rounds'] = ($loopState['discovery_rounds'] ?? 0) + 1;
+
+        return $loopState;
+    }
+
+    private function extractShortageFromProposalError(string $error): ?int
+    {
+        if (preg_match('/You are SHORT by (\d+)/', $error, $matches) === 1) {
+            return (int) $matches[1];
+        }
+
+        return null;
+    }
+
+    private function blockedRepairToolResult(Conversation $conversation, array $loopState, string $toolName): ?array
+    {
+        if ($conversation->deck_id) {
+            return null;
+        }
+
+        $shortage = $loopState['last_shortage'] ?? null;
+        if (($loopState['in_repair'] ?? false) !== true || ! is_int($shortage) || $shortage <= 0) {
+            return null;
+        }
+
+        if (! in_array($toolName, ['get_collection', 'search_cards', 'search_scryfall'], true)) {
+            return null;
+        }
+
+        $resolvedSummary = implode(', ', array_map(
+            fn ($card) => sprintf('%s ×%d', $card['name'] ?? 'Unknown Card', (int) ($card['quantity'] ?? 0)),
+            $loopState['last_candidate']['cards'] ?? []
+        ));
+
+        $colorMap = ['W' => 'Plains', 'U' => 'Island', 'B' => 'Swamp', 'R' => 'Mountain', 'G' => 'Forest'];
+        $deckColors = $loopState['last_candidate']['color_identity'] ?? [];
+        $suggestedLands = array_values(array_intersect_key($colorMap, array_flip($deckColors)));
+        $landHint = $suggestedLands !== []
+            ? ' For this deck\'s color identity [' . implode('/', $deckColors) . '] use: ' . implode(', ', $suggestedLands) . '.'
+            : ' Use basic lands matching the deck\'s color identity (Plains for W, Island for U, Swamp for B, Mountain for R, Forest for G).';
+
+        return [
+            'error' => "Repair mode: the last propose_deck call was short by {$shortage} card(s). Do not do more exploratory searches or repeat get_collection. Add exactly {$shortage} basic land(s) to reach the required count.{$landHint} These always resolve and are always legal. Then call propose_deck again with the complete corrected list. Current resolved list: [{$resolvedSummary}].",
+        ];
+    }
+
     // -------------------------------------------------------------------------
     // Tool execution
     // -------------------------------------------------------------------------
 
-    private function executeTool(array $call, User $user, Conversation $conversation): array
+    private function executeTool(string $name, array $args, User $user, Conversation $conversation): array
     {
-        $name = $call['function']['name'];
-        $args = json_decode($call['function']['arguments'] ?? '{}', true) ?? [];
-
         return match ($name) {
             'get_collection'       => $this->toolGetCollection($user, $args),
             'get_decks'            => $this->toolGetDecks($user),
@@ -485,12 +944,7 @@ class AiChatService
             ->with([]);
 
         if (! empty($args['colors'])) {
-            $colors = $args['colors'];
-            $query->where(function ($q) use ($colors) {
-                foreach ($colors as $color) {
-                    $q->orWhereJsonContains('color_identity', $color);
-                }
-            });
+            $this->applyAllowedColorsToCardQuery($query, $args['colors']);
         }
 
         if (! empty($args['format'])) {
@@ -593,20 +1047,29 @@ class AiChatService
     private function toolSearchCards(array $args): array
     {
         $query = Card::query();
+        $term = trim((string) ($args['query'] ?? ''));
+        $rolePatterns = $this->searchRolePatterns($term);
 
-        if (! empty($args['query'])) {
-            $term = $args['query'];
+        if ($term !== '') {
             $query->where(function ($q) use ($term) {
                 $q->where('name', 'like', "%{$term}%")
                   ->orWhere('oracle_text', 'like', "%{$term}%")
                   ->orWhere('type_line', 'like', "%{$term}%");
             });
+
+            if ($rolePatterns !== []) {
+                $query->orWhere(function ($q) use ($rolePatterns) {
+                    foreach ($rolePatterns as $pattern) {
+                        $q->orWhere('name', 'like', "%{$pattern}%")
+                            ->orWhere('oracle_text', 'like', "%{$pattern}%")
+                            ->orWhere('type_line', 'like', "%{$pattern}%");
+                    }
+                });
+            }
         }
 
         if (! empty($args['colors'])) {
-            foreach ($args['colors'] as $color) {
-                $query->whereJsonContains('color_identity', $color);
-            }
+            $this->applyAllowedColorsToCardQuery($query, $args['colors']);
         }
 
         if (! empty($args['format'])) {
@@ -614,7 +1077,25 @@ class AiChatService
             $query->where("legalities->{$format}", 'legal');
         }
 
-        $cards = $query->limit(30)->get()->map(fn ($card) => [
+        $cards = $query->limit(150)->get()
+            ->sort(function (Card $left, Card $right) use ($term, $rolePatterns) {
+                $leftSort = [
+                    $this->searchCardRank($left, $term, $rolePatterns),
+                    $left->price_usd ?? 0.0,
+                    $left->cmc ?? 0.0,
+                    strtolower($left->name ?? ''),
+                ];
+                $rightSort = [
+                    $this->searchCardRank($right, $term, $rolePatterns),
+                    $right->price_usd ?? 0.0,
+                    $right->cmc ?? 0.0,
+                    strtolower($right->name ?? ''),
+                ];
+
+                return $leftSort <=> $rightSort;
+            })
+            ->take(60)
+            ->map(fn ($card) => [
             'id'             => $card->id,
             'name'           => $card->name,
             'type_line'      => $card->type_line,
@@ -628,9 +1109,85 @@ class AiChatService
         return ['cards' => $cards->values()->all()];
     }
 
+    private function searchCardRank(Card $card, string $term, array $rolePatterns): int
+    {
+        $normalizedTerm = strtolower(trim($term));
+        $name = strtolower($card->name ?? '');
+        $typeLine = strtolower($card->type_line ?? '');
+        $oracleText = strtolower($card->oracle_text ?? '');
+
+        $score = 1000;
+
+        if ($normalizedTerm !== '') {
+            if ($name === $normalizedTerm) {
+                $score -= 800;
+            } elseif (str_starts_with($name, $normalizedTerm)) {
+                $score -= 500;
+            } elseif (str_contains($name, $normalizedTerm)) {
+                $score -= 300;
+            } elseif (str_contains($typeLine, $normalizedTerm)) {
+                $score -= 150;
+            } elseif (str_contains($oracleText, $normalizedTerm)) {
+                $score -= 100;
+            }
+        }
+
+        foreach ($rolePatterns as $pattern) {
+            if (str_contains($name, $pattern)) {
+                $score -= 120;
+            }
+            if (str_contains($typeLine, $pattern)) {
+                $score -= 80;
+            }
+            if (str_contains($oracleText, $pattern)) {
+                $score -= 60;
+            }
+        }
+
+        if (str_contains($typeLine, 'land') && preg_match('/\bland\b/i', $term) === 1) {
+            $score -= 120;
+        }
+
+        return $score;
+    }
+
+    private function searchRolePatterns(string $term): array
+    {
+        $normalized = strtolower(trim($term));
+        if ($normalized === '') {
+            return [];
+        }
+
+        $patterns = [];
+
+        $roleMap = [
+            'ramp' => ['add {', 'search your library for a basic land', 'mana of any color', 'treasure token', 'mana rock'],
+            'draw' => ['draw a card', 'draw two cards', 'whenever you draw', 'impulse', 'loot'],
+            'removal' => ['destroy target', 'exile target', 'deals damage to target', '-x/-x', 'sacrifice target'],
+            'interaction' => ['counter target', 'destroy target', 'exile target', 'tap target', 'return target'],
+            'counterspell' => ['counter target spell', 'counter target'],
+            'cantrip' => ['draw a card', 'scry', 'surveil'],
+            'finisher' => ['double strike', 'extra combat', 'each opponent loses', 'cannot be blocked', '+x/+0'],
+            'payoff' => ['whenever another', 'whenever you cast', 'create a token', 'creatures you control get'],
+            'tokens' => ['create a token', 'create two', 'create three'],
+            'haste' => ['haste', 'gains haste'],
+            'tempo' => ['return target', 'tap target', 'counter target', 'flash', 'flying'],
+            'control' => ['counter target', 'destroy target', 'exile target', 'draw a card'],
+        ];
+
+        foreach ($roleMap as $keyword => $mappedPatterns) {
+            if (str_contains($normalized, $keyword)) {
+                array_push($patterns, ...$mappedPatterns);
+            }
+        }
+
+        return array_values(array_unique(array_map('strtolower', $patterns)));
+    }
+
     private function toolSearchScryfall(array $args): array
     {
-        $query = trim($args['query'] ?? '');
+        $allowedColors = $this->normalizeColorCodes($args['colors'] ?? []);
+        $query = $this->applyScryfallColorIdentityConstraint(trim($args['query'] ?? ''), $allowedColors);
         if ($query === '') {
             return ['error' => 'query is required'];
         }
@@ -645,7 +1202,7 @@ class AiChatService
         }
 
         $cards = array_slice(
-            array_map(fn ($card) => [
+            array_values(array_filter(array_map(fn ($card) => [
                 'name'           => $card['name'],
                 'type_line'      => $card['type_line'],
                 'mana_cost'      => $card['mana_cost'],
@@ -655,12 +1212,154 @@ class AiChatService
                 'rarity'         => $card['rarity'],
                 'price_usd'      => $card['price_usd'] ?? null,
                 'legalities'     => $card['legalities'],
-            ], $results),
+            ], $results), fn ($card) => $this->cardMatchesAllowedColors($card['color_identity'] ?? [], $allowedColors))),
             0,
             20
         );
 
         return ['cards' => $cards, 'total' => count($results)];
+    }
+
+    private function normalizeToolArgs(Conversation $conversation, array $loopState, string $toolName, array $args): array
+    {
+        $buildColors = $this->normalizeColorCodes($loopState['build_search_colors'] ?? []);
+
+        if ($buildColors !== [] && in_array($toolName, ['get_collection', 'search_cards', 'search_scryfall'], true)) {
+            // Always override colors with the locked build/deck colors so the AI
+            // never receives cards outside the deck's color identity.
+            $args['colors'] = $buildColors;
+        }
+
+        if (! $conversation->deck_id) {
+            if ($toolName === 'get_commander_guide' && empty($args['commander_name']) && ! empty($loopState['build_commander_name'])) {
+                $args['commander_name'] = $loopState['build_commander_name'];
+            }
+        }
+
+        return $args;
+    }
+
+    private function applyAllowedColorsToCardQuery($query, array $colors): void
+    {
+        $allowedColors = $this->normalizeColorCodes($colors);
+        if ($allowedColors === []) {
+            return;
+        }
+
+        $disallowedColors = array_values(array_diff(['W', 'U', 'B', 'R', 'G'], $allowedColors));
+        foreach ($disallowedColors as $color) {
+            $query->whereJsonDoesntContain('color_identity', $color);
+        }
+    }
+
+    private function applyScryfallColorIdentityConstraint(string $query, array $colors): string
+    {
+        $query = trim($query);
+        if ($query === '' || $colors === []) {
+            return $query;
+        }
+
+        if (preg_match('/\bid\s*(?:[:<>]=?|=)\s*/i', $query) === 1) {
+            return $query;
+        }
+
+        $constraint = $colors === ['C']
+            ? 'id=0'
+            : 'id<=' . strtolower(implode('', array_values(array_diff($colors, ['C']))));
+
+        return trim($query . ' ' . $constraint);
+    }
+
+    private function cardMatchesAllowedColors(array $cardColors, array $allowedColors): bool
+    {
+        $allowedColors = $this->normalizeColorCodes($allowedColors);
+        if ($allowedColors === []) {
+            return true;
+        }
+
+        $cardColors = $this->normalizeColorCodes($cardColors);
+        if ($allowedColors === ['C']) {
+            return $cardColors === [];
+        }
+
+        return array_diff($cardColors, array_diff($allowedColors, ['C'])) === [];
+    }
+
+    private function normalizeColorCodes(array $colors): array
+    {
+        $normalized = [];
+        foreach ($colors as $color) {
+            if (! is_string($color)) {
+                continue;
+            }
+
+            $color = strtoupper(trim($color));
+            if (in_array($color, ['W', 'U', 'B', 'R', 'G', 'C'], true) && ! in_array($color, $normalized, true)) {
+                $normalized[] = $color;
+            }
+        }
+
+        return $normalized;
+    }
+
+    private function extractCommanderNameFromText(string $text): ?string
+    {
+        if (preg_match('/Commander:\s*([^.\n]+)/i', $text, $matches) !== 1) {
+            return null;
+        }
+
+        $name = trim($matches[1]);
+
+        return $name !== '' ? $name : null;
+    }
+
+    private function extractSearchColorsFromText(string $text): array
+    {
+        if (preg_match('/Search colors:\s*\[([^\]]+)\]/i', $text, $matches) === 1) {
+            return $this->normalizeColorCodes(preg_split('/[\s,\/]+/', $matches[1], -1, PREG_SPLIT_NO_EMPTY) ?: []);
+        }
+
+        if (preg_match('/Colors:\s*([^.\n]+)/i', $text, $matches) !== 1) {
+            return [];
+        }
+
+        $segment = strtolower(trim($matches[1]));
+        if ($segment === 'colorless cards only') {
+            return ['C'];
+        }
+
+        $map = [
+            'white' => 'W',
+            'blue' => 'U',
+            'black' => 'B',
+            'red' => 'R',
+            'green' => 'G',
+            'colorless' => 'C',
+        ];
+
+        $colors = [];
+        foreach ($map as $label => $code) {
+            if (str_contains($segment, $label)) {
+                $colors[] = $code;
+            }
+        }
+
+        return $this->normalizeColorCodes($colors);
+    }
+
+    private function nameToEdhrecSlug(string $name): string
+    {
+        $slug = strtolower($name);
+        $slug = str_replace("'", '', $slug);
+        $slug = preg_replace('/[^a-z0-9]+/', '-', $slug);
+        return trim($slug, '-');
+    }
+
+    private function resolveCommanderColorIdentity(string $commanderName): array
+    {
+        $card = Card::whereRaw('LOWER(name) = ?', [strtolower($commanderName)])->first();
+
+        return $this->normalizeColorCodes($card?->color_identity ?? []);
     }
 
     private function toolGetCommanderGuide(array $args): array
@@ -670,29 +1369,122 @@ class AiChatService
             return ['error' => 'commander_name is required'];
         }
 
-        // Try exact match first, then fuzzy LIKE
-        $sample = SampleDeck::where('commander_name', $commanderName)->first()
-            ?? SampleDeck::where('commander_name', 'like', '%' . $commanderName . '%')->first();
+        $validTiers = ['budget', 'average', 'expensive'];
+        $budgetTier = in_array($args['budget_tier'] ?? '', $validTiers, true)
+            ? $args['budget_tier']
+            : 'average';
+
+        $commanderCard = Card::whereRaw('LOWER(name) = ?', [strtolower($commanderName)])->first();
+        if (! $commanderCard) {
+            try {
+                $data = app(ScryfallService::class)->findCard($commanderName);
+                $commanderCard = Card::updateOrCreate(
+                    ['scryfall_id' => $data['scryfall_id']],
+                    $data
+                );
+            } catch (\Throwable $e) {
+                Log::warning('AiChatService: could not resolve commander card', [
+                    'name' => $commanderName,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        // Try exact match for the requested tier first, then fuzzy name match,
+        // then fall back to 'average' if the specific tier isn't cached yet.
+        $sample = SampleDeck::where('commander_name', $commanderName)
+                ->where('budget_tier', $budgetTier)->first()
+            ?? SampleDeck::where('commander_name', 'like', '%' . $commanderName . '%')
+                ->where('budget_tier', $budgetTier)->first();
+
+        // If not cached, fetch from EDHREC inline (synchronous) and re-query.
+        if (! $sample && $commanderCard) {
+            $slug = $this->nameToEdhrecSlug($commanderCard->name);
+            try {
+                FetchCommanderAverageDeck::dispatchSync($commanderCard->name, $slug, $budgetTier);
+                $sample = SampleDeck::where('commander_slug', $slug)
+                    ->where('budget_tier', $budgetTier)->first();
+            } catch (\Throwable $e) {
+                Log::warning('AiChatService: inline EDHREC fetch failed', [
+                    'commander'   => $commanderName,
+                    'budget_tier' => $budgetTier,
+                    'error'       => $e->getMessage(),
+                ]);
+            }
+        }
+
+        // If the requested tier still isn't available, fall back to 'average'.
+        if (! $sample && $budgetTier !== 'average') {
+            $sample = SampleDeck::where('commander_name', $commanderName)
+                    ->where('budget_tier', 'average')->first()
+                ?? SampleDeck::where('commander_name', 'like', '%' . $commanderName . '%')
+                    ->where('budget_tier', 'average')->first();
+        }
 
         if (! $sample) {
             return [
-                'found'    => false,
-                'message'  => "No sample deck found for commander \"{$commanderName}\". Build from your own knowledge.",
+                'found'       => false,
+                'budget_tier' => $budgetTier,
+                'message'     => "No EDHREC deck found for commander \"{$commanderName}\". Build from your own knowledge of this commander.",
+                'commander'   => $commanderCard ? [
+                    'name'           => $commanderCard->name,
+                    'type_line'      => $commanderCard->type_line,
+                    'mana_cost'      => $commanderCard->mana_cost,
+                    'color_identity' => $commanderCard->color_identity,
+                    'oracle_text'    => $commanderCard->oracle_text ? mb_substr($commanderCard->oracle_text, 0, 200) : null,
+                ] : null,
             ];
         }
+
+        // Bulk-resolve EDHREC card names from the local DB so the AI gets type,
+        // mana cost, price, and color identity for role-matched substitution.
+        $sampleCards = collect($sample->cards);
+        $cardNames   = $sampleCards->pluck('name')->all();
+        $dbCards     = Card::whereIn('name', $cardNames)->get()->keyBy('name');
+
+        $enrichedCards = $sampleCards->map(function ($entry) use ($dbCards) {
+            $card = $dbCards->get($entry['name']);
+            return [
+                'name'           => $entry['name'],
+                'quantity'       => $entry['quantity'],
+                'type_line'      => $card?->type_line,
+                'mana_cost'      => $card?->mana_cost,
+                'cmc'            => $card?->cmc,
+                'color_identity' => $card?->color_identity,
+                'oracle_text'    => $card?->oracle_text ? mb_substr($card->oracle_text, 0, 100) : null,
+                'price_usd'      => $card?->price_usd,
+            ];
+        })->values()->all();
 
         return [
             'found'          => true,
             'commander_name' => $sample->commander_name,
-            'source'         => 'EDHREC average deck (human-curated)',
+            'budget_tier'    => $sample->budget_tier,
+            'commander'      => $commanderCard ? [
+                'name'           => $commanderCard->name,
+                'type_line'      => $commanderCard->type_line,
+                'mana_cost'      => $commanderCard->mana_cost,
+                'color_identity' => $commanderCard->color_identity,
+                'oracle_text'    => $commanderCard->oracle_text ? mb_substr($commanderCard->oracle_text, 0, 200) : null,
+            ] : null,
+            'source'         => 'EDHREC ' . $sample->budget_tier . ' deck (human-curated)',
             'fetched_at'     => $sample->fetched_at?->toDateString(),
-            'total_cards'    => collect($sample->cards)->sum('quantity'),
-            'cards'          => $sample->cards,
+            'total_cards'    => $sampleCards->sum('quantity'),
+            'cards'          => $enrichedCards,
         ];
     }
 
     private function toolProposeDeck(array $args, User $user, Conversation $conversation): array
     {
+        // New deck builds are Commander-only. Improvement sessions (deck_id set) allow any format.
+        if (! $conversation->deck_id) {
+            $submittedFormat = strtolower(trim($args['format'] ?? ''));
+            if (! in_array($submittedFormat, ['commander', 'edh', 'brawl'], true)) {
+                $error = 'Deck rejected: new deck building is Commander / EDH only. Set format to "commander" and include a commander card with role "commander".';
+                return ['error' => $error, 'draft_candidate' => null];
+            }
+        }
+
         $scryfall = app(ScryfallService::class);
         $entries  = collect($args['cards'] ?? []);
 
@@ -752,7 +1544,8 @@ class AiChatService
         // The AI occasionally submits the same card twice (e.g. "Island ×35" and
         // "Island ×5") which would pass a 100-card count check here but then get
         // clobbered by the unique constraint in deck_cards on insert.
-        $merged = [];
+        $merged        = [];
+        $mergedNames   = []; // track cards that appeared more than once
         foreach ($resolvedCards as $item) {
             $card  = $item['card'];
             $entry = $item['entry'];
@@ -761,12 +1554,14 @@ class AiChatService
 
             if (isset($merged[$id])) {
                 $merged[$id]['quantity'] += $qty;
+                $mergedNames[$card->name]  = $merged[$id]['quantity'];
             } else {
                 $merged[$id] = [
                     'card_id'        => $id,
                     'name'           => $card->name,
                     'type_line'      => $card->type_line,
                     'mana_cost'      => $card->mana_cost,
+                    'color_identity' => $card->color_identity,
                     'image_uri'      => $card->image_uri,
                     'quantity'       => $qty,
                     'owned_quantity' => $ownedMap[$id] ?? 0,
@@ -781,9 +1576,9 @@ class AiChatService
         $totalCards = array_sum(array_column($cards, 'quantity'));
 
         $formatRequirements = [
-            'commander' => ['exact' => 100, 'max_copies' => 1, 'max_lands' => 45, 'max_basic_single' => 35],
-            'edh'       => ['exact' => 100, 'max_copies' => 1, 'max_lands' => 45, 'max_basic_single' => 35],
-            'brawl'     => ['exact' => 60,  'max_copies' => 1, 'max_lands' => 30, 'max_basic_single' => 20],
+            'commander' => ['exact' => 100, 'max_copies' => 1, 'max_lands' => 40, 'max_basic_single' => 25],
+            'edh'       => ['exact' => 100, 'max_copies' => 1, 'max_lands' => 40, 'max_basic_single' => 25],
+            'brawl'     => ['exact' => 60,  'max_copies' => 1, 'max_lands' => 28, 'max_basic_single' => 18],
             'standard'  => ['min'   => 60,  'max_copies' => 4, 'max_lands' => 30, 'max_basic_single' => 20],
             'modern'    => ['min'   => 60,  'max_copies' => 4, 'max_lands' => 30, 'max_basic_single' => 20],
             'pioneer'   => ['min'   => 60,  'max_copies' => 4, 'max_lands' => 30, 'max_basic_single' => 20],
@@ -798,6 +1593,14 @@ class AiChatService
             ? ' These card names could not be found and were dropped — replace them with real card names: ' . implode(', ', $unresolvedNames) . '.'
             : '';
 
+        // Warn the AI when it submitted the same card more than once.
+        // This causes the merged quantity to exceed max_copies and leads to a loop
+        // where the AI tries to "fix" ×2 without realising it listed the card twice.
+        $duplicateHint = ! empty($mergedNames)
+            ? ' WARNING: you listed these cards more than once in your submission and their quantities were summed — submit each card only once: '
+              . implode(', ', array_map(fn ($n, $q) => "{$n} (merged to ×{$q})", array_keys($mergedNames), $mergedNames)) . '.'
+            : '';
+
         // Compact resolved list for feedback — just name + quantity so the AI can
         // see exactly what was counted and make surgical edits rather than rebuilding.
         $resolvedSummary = implode(', ', array_map(
@@ -805,8 +1608,103 @@ class AiChatService
             $cards
         ));
 
+        $declaredColorIdentity = array_values(array_filter(
+            array_map('strtoupper', $args['color_identity'] ?? []),
+            fn ($c) => in_array($c, ['W', 'U', 'B', 'R', 'G'], true)
+        ));
+
+        $draftCandidate = [
+            'deck_name'         => $args['deck_name'] ?? 'New Deck',
+            'format'            => $args['format'] ?? null,
+            'strategy_summary'  => $args['strategy_summary'] ?? null,
+            'cards'             => $cards,
+            'color_identity'    => $declaredColorIdentity,
+            'validation_message'=> null,
+        ];
+
         $req = $formatRequirements[$format] ?? null;
         if ($req) {
+            if (in_array($format, ['commander', 'edh', 'brawl'], true)) {
+                $commanderCards = array_values(array_filter(
+                    $cards,
+                    fn ($card) => strtolower((string) ($card['role'] ?? '')) === 'commander'
+                ));
+
+                if (count($commanderCards) !== 1) {
+                    $error = 'Deck rejected: exactly one commander card with role "commander" is required for this format.';
+                    $draftCandidate['validation_message'] = $error;
+                    return ['error' => $error, 'draft_candidate' => $draftCandidate];
+                }
+
+                $commander = $commanderCards[0];
+                $commanderModel = collect($resolvedCards)
+                    ->first(fn ($item) => $item['card']->id === $commander['card_id']);
+
+                $commanderColors = array_values($commanderModel['card']->color_identity ?? []);
+                $offenders = [];
+
+                foreach ($cards as $card) {
+                    $cardColors = array_values($card['color_identity'] ?? []);
+                    $outsideColors = array_values(array_diff($cardColors, $commanderColors));
+
+                    if ($outsideColors !== []) {
+                        $offenders[] = sprintf(
+                            '%s [%s]',
+                            $card['name'],
+                            implode('/', $outsideColors)
+                        );
+                    }
+                }
+
+                if ($offenders !== []) {
+                    $list = implode(', ', array_slice($offenders, 0, 12));
+                    $error = 'Deck rejected: color identity violation. Commander '
+                        . $commander['name']
+                        . ' allows only [' . implode('/', $commanderColors ?: ['colorless']) . ']. '
+                        . 'These cards are outside that color identity: '
+                        . $list . '.';
+                    $draftCandidate['validation_message'] = $error;
+                    return ['error' => $error, 'draft_candidate' => $draftCandidate];
+                }
+            }
+
+            // Color identity check for non-commander formats (commander formats use the commander card above).
+            // If the AI declared a color_identity for the deck, enforce it server-side.
+            if (! in_array($format, ['commander', 'edh', 'brawl'], true)) {
+                $declaredColors = array_values(array_filter(
+                    array_map('strtoupper', $args['color_identity'] ?? []),
+                    fn ($c) => in_array($c, ['W', 'U', 'B', 'R', 'G'], true)
+                ));
+
+                if ($declaredColors !== []) {
+                    $colorOffenders = [];
+                    foreach ($cards as $card) {
+                        $cardColors = array_values($card['color_identity'] ?? []);
+                        $outsideColors = array_values(array_diff($cardColors, $declaredColors));
+                        if ($outsideColors !== []) {
+                            $colorOffenders[] = sprintf('%s [%s]', $card['name'], implode('/', $outsideColors));
+                        }
+                    }
+
+                    if ($colorOffenders !== []) {
+                        $list  = implode(', ', array_slice($colorOffenders, 0, 12));
+                        $error = 'Deck rejected: color identity violation. This deck is declared as ['
+                            . implode('/', $declaredColors)
+                            . '] but these cards are outside that color identity: '
+                            . $list
+                            . '. Remove them and replace with cards whose color identity fits within ['
+                            . implode('/', $declaredColors) . '].';
+                        Log::warning('AiChatService: propose_deck rejected — non-commander color identity violation', [
+                            'format'          => $format,
+                            'declared_colors' => $declaredColors,
+                            'offenders'       => $colorOffenders,
+                        ]);
+                        $draftCandidate['validation_message'] = $error;
+                        return ['error' => $error, 'draft_candidate' => $draftCandidate];
+                    }
+                }
+            }
+
             if (isset($req['exact']) && $totalCards !== $req['exact']) {
                 $diff = $req['exact'] - $totalCards;
                 $action = $diff > 0
@@ -816,7 +1714,28 @@ class AiChatService
                     'format' => $format, 'required' => $req['exact'], 'submitted' => $totalCards,
                     'unresolved' => $unresolvedNames,
                 ]);
-                return ['error' => "Deck rejected: {$format} requires exactly {$req['exact']} cards. {$totalCards} resolved.{$unresolvedHint} {$action} Do NOT change any other cards — only add or remove the exact difference. Resolved card list: [{$resolvedSummary}]. Then call propose_deck again with the complete corrected list."];
+                // Build a concrete "add X spells + Y lands" directive so the AI never
+                // pads a short deck with pure basic lands.
+                $fillDirective = '';
+                if ($diff > 0 && isset($req['max_lands'], $req['exact'])) {
+                    $currentLands = array_sum(array_map(
+                        fn ($c) => str_contains($c['type_line'] ?? '', 'Land') ? $c['quantity'] : 0,
+                        $cards
+                    ));
+                    $targetLands   = 38; // ideal commander land count
+                    $landsAllowed  = max(0, $targetLands - $currentLands);
+                    $landsToAdd    = min($landsAllowed, $diff);
+                    $spellsToAdd   = $diff - $landsToAdd;
+                    if ($spellsToAdd > 0 && $landsToAdd > 0) {
+                        $fillDirective = " FILL BREAKDOWN: add exactly {$spellsToAdd} spell(s)/creature(s) and {$landsToAdd} basic land(s) of the commander's colors (not more, not fewer). Do NOT add all {$diff} as basic lands.";
+                    } elseif ($spellsToAdd > 0) {
+                        $fillDirective = " FILL: you already have {$currentLands} lands (target 36–38) — add all {$spellsToAdd} card(s) as spells or creatures, NOT basic lands.";
+                    }
+                    // else all lands allowed (diff is small and deck is under target) — no directive needed
+                }
+                $error = "Deck rejected: {$format} requires exactly {$req['exact']} cards. {$totalCards} resolved.{$unresolvedHint}{$duplicateHint}{$fillDirective} {$action} Do NOT change any other cards — only add or remove the exact difference. Resolved card list: [{$resolvedSummary}]. Then call propose_deck again with the complete corrected list.";
+                $draftCandidate['validation_message'] = $error;
+                return ['error' => $error, 'draft_candidate' => $draftCandidate];
             }
 
             if (isset($req['min']) && $totalCards < $req['min']) {
@@ -825,7 +1744,9 @@ class AiChatService
                     'format' => $format, 'minimum' => $req['min'], 'submitted' => $totalCards,
                     'unresolved' => $unresolvedNames,
                 ]);
-                return ['error' => "Deck rejected: {$format} requires at least {$req['min']} cards. {$totalCards} resolved.{$unresolvedHint} Add exactly {$diff} more card(s). Resolved card list: [{$resolvedSummary}]. Then call propose_deck again with the complete corrected list."];
+                $error = "Deck rejected: {$format} requires at least {$req['min']} cards. {$totalCards} resolved.{$unresolvedHint}{$duplicateHint} Add exactly {$diff} more card(s). Resolved card list: [{$resolvedSummary}]. Then call propose_deck again with the complete corrected list.";
+                $draftCandidate['validation_message'] = $error;
+                return ['error' => $error, 'draft_candidate' => $draftCandidate];
             }
 
             if (isset($req['max_copies'])) {
@@ -844,7 +1765,17 @@ class AiChatService
                         'format' => $format, 'max_copies' => $maxCopies, 'violations' => $violations,
                     ]);
                     $list = implode(', ', $violations);
-                    return ['error' => "Deck rejected: {$format} allows at most {$maxCopies} cop" . ($maxCopies === 1 ? 'y' : 'ies') . " of each non-basic land card. Fix these cards: {$list}. Resolved card list: [{$resolvedSummary}]. Then call propose_deck again with the complete corrected list."];
+                    // Compute how many excess copies exist so the AI knows how many replacements to add
+                    $excessCopies = 0;
+                    foreach ($cards as $card) {
+                        $isBasicLandForExcess = str_contains($card['type_line'] ?? '', 'Basic Land');
+                        if (! $isBasicLandForExcess && $card['quantity'] > $maxCopies) {
+                            $excessCopies += $card['quantity'] - $maxCopies;
+                        }
+                    }
+                    $error = "Deck rejected: {$format} allows at most {$maxCopies} cop" . ($maxCopies === 1 ? 'y' : 'ies') . " of each non-basic land card. Fix these cards: {$list}. Reducing those quantities removes {$excessCopies} card(s) from the deck — you MUST add {$excessCopies} different card(s) as replacements to keep the total at {$totalCards}.{$duplicateHint} Resolved card list: [{$resolvedSummary}]. Then call propose_deck again with the complete corrected list.";
+                    $draftCandidate['validation_message'] = $error;
+                    return ['error' => $error, 'draft_candidate' => $draftCandidate];
                 }
             }
 
@@ -871,7 +1802,12 @@ class AiChatService
                     Log::warning('AiChatService: propose_deck rejected — too many lands', [
                         'format' => $format, 'max_lands' => $maxLands, 'submitted' => $totalLands,
                     ]);
-                    return ['error' => "Deck rejected: too many lands. {$format} should have at most {$maxLands} lands but you submitted {$totalLands}. Remove {$excess} land(s) and replace them with spells. Resolved card list: [{$resolvedSummary}]. Then call propose_deck again with the corrected list."];
+                    $nonLands = $totalCards - $totalLands;
+                    $requiredTotal = $req['exact'] ?? $totalCards;
+                    $targetLandsMsg = 38;
+                    $error = "Deck rejected: too many lands. You submitted {$totalLands} lands but a Commander deck should have 36–38 (hard max {$maxLands}). You only have {$nonLands} non-land cards — a playable deck needs ~62. Remove {$excess} land(s) and add {$excess} spell(s) or creature(s) in their place so the total stays at {$requiredTotal}. Do NOT just delete them. Resolved card list: [{$resolvedSummary}]. Then call propose_deck again with the corrected list.";
+                    $draftCandidate['validation_message'] = $error;
+                    return ['error' => $error, 'draft_candidate' => $draftCandidate];
                 }
 
                 if (isset($req['max_basic_single'])) {
@@ -882,7 +1818,10 @@ class AiChatService
                             Log::warning('AiChatService: propose_deck rejected — too many of a single basic land', [
                                 'format' => $format, 'land' => $basicName, 'quantity' => $qty, 'max' => $maxBasicSingle,
                             ]);
-                            return ['error' => "Deck rejected: too many copies of \"{$basicName}\" ({$qty}). Max allowed is {$maxBasicSingle} of any single basic land type. Remove {$excess} cop" . ($excess === 1 ? 'y' : 'ies') . " and replace with spells or other land types. Resolved card list: [{$resolvedSummary}]. Then call propose_deck again with the corrected list."];
+                            $requiredTotal = $req['exact'] ?? $totalCards;
+                            $error = "Deck rejected: too many copies of \"{$basicName}\" ({$qty}). Max allowed is {$maxBasicSingle} of any single basic land type. Remove {$excess} cop" . ($excess === 1 ? 'y' : 'ies') . " and replace them with {$excess} spell(s) or other land type(s) — do NOT just delete them, the total must still reach {$requiredTotal}. Resolved card list: [{$resolvedSummary}]. Then call propose_deck again with the corrected list.";
+                            $draftCandidate['validation_message'] = $error;
+                            return ['error' => $error, 'draft_candidate' => $draftCandidate];
                         }
                     }
                 }
@@ -900,7 +1839,13 @@ class AiChatService
         ]);
 
         $syncData = collect($cards)
-            ->mapWithKeys(fn ($c) => [$c['card_id'] => ['quantity' => $c['quantity'], 'is_sideboard' => false]])
+            ->mapWithKeys(fn ($c) => [
+                $c['card_id'] => [
+                    'quantity'     => $c['quantity'],
+                    'is_sideboard' => false,
+                    'is_commander' => strtolower((string) ($c['role'] ?? '')) === 'commander',
+                ],
+            ])
             ->all();
         $draft->cards()->sync($syncData);
 
@@ -1215,13 +2160,18 @@ class AiChatService
                 'type'     => 'function',
                 'function' => [
                     'name'        => 'get_commander_guide',
-                    'description' => 'Look up an EDHREC average deck for a specific Commander. Returns the card list that experienced human players most commonly include when building around that commander. Use this as a reference for card selection and ratios before building.',
+                    'description' => 'Look up an EDHREC deck for a specific Commander. Returns the card list that human players most commonly include. Pass budget_tier to get a price-appropriate baseline: "budget" (<$50), "average" ($50–$300), "expensive" (>$300 / no limit).',
                     'parameters'  => [
                         'type'       => 'object',
                         'properties' => [
                             'commander_name' => [
                                 'type'        => 'string',
                                 'description' => 'Full name of the commander card, exactly as printed (e.g. "Atraxa, Praetors\' Voice").',
+                            ],
+                            'budget_tier' => [
+                                'type'        => 'string',
+                                'enum'        => ['budget', 'average', 'expensive'],
+                                'description' => 'Price tier for the EDHREC deck. "budget" for decks under ~$50, "expensive" for decks over ~$300 or no budget limit, "average" otherwise.',
                             ],
                         ],
                         'required' => ['commander_name'],
@@ -1311,6 +2261,11 @@ class AiChatService
                                 'type'        => 'string',
                                 'description' => 'MTG format (e.g. commander, modern, standard).',
                             ],
+                            'color_identity' => [
+                                'type'        => 'array',
+                                'items'       => ['type' => 'string', 'enum' => ['W', 'U', 'B', 'R', 'G']],
+                                'description' => 'The intended color identity of the deck (e.g. ["R"] for mono-red, ["U","B"] for Dimir). Every non-colorless card submitted must have a color identity that is a subset of this list. Required for all formats.',
+                            ],
                             'strategy_summary' => [
                                 'type'        => 'string',
                                 'description' => 'One or two sentence summary of the deck strategy.',
@@ -1348,57 +2303,116 @@ class AiChatService
         return <<<PROMPT
 You are VaultMage, an expert Magic: The Gathering deck building assistant.
 
-Your job is to build decks and improve existing decks. When a user describes what they want, start working immediately.
+Your job is to build Commander decks and improve existing decks. When a user describes what they want, start working immediately.
 
-Deck size and copy limits (you MUST meet these exactly before calling propose_deck):
-- Commander / EDH: exactly 100 cards. The commander card MUST be included in the `cards` array (with role "commander") — it counts as 1 of the 100. SINGLETON: max 1 copy of every non-basic land card. Basic lands (Plains, Island, Swamp, Mountain, Forest, Wastes, Snow-Covered basics) may appear in any quantity.
-- Brawl: exactly 60 cards. The commander/brawl commander MUST be included in the `cards` array (with role "commander") — it counts as 1 of the 60. SINGLETON: same singleton rule as Commander.
+═══════════════════════════════════════
+NEW DECK BUILDS — COMMANDER ONLY
+═══════════════════════════════════════
 
-Color identity rules (STRICTLY enforced — violations make a deck illegal):
-- Every card in the deck MUST have a color identity that is a subset of the commander's color identity. No exceptions except for colorless cards (which are always allowed).
-- Example: a mono-black commander (color identity [B]) allows only black cards, colorless cards, and colorless/black lands. No white, blue, red, or green cards of any kind.
-- Before including any card, verify its color identity matches the commander's colors.
+New deck builds are Commander / EDH only. If the user asks for another format, politely explain that new builds are Commander-only for now and ask for a commander name.
 
-Land count guidelines (HARD LIMITS — propose_deck will be REJECTED if you exceed these):
-- Commander / EDH: 36–38 lands total (hard max 45). Aim for 10–20 basic lands; NEVER more than 35 of any single basic land type.
-- Brawl: ~24 lands total (hard max 30). NEVER more than 20 of any single basic land type.
-- Standard / Modern / Pioneer / Legacy / Vintage / Pauper: 20–26 lands (hard max 30). NEVER more than 20 of any single basic land type.
-- Draft / Sealed: ~17 lands (hard max 25). NEVER more than 15 of any single basic land type.
-- Use leftover slots for spells, not extra basic lands. A 100-card Commander deck needs ~62 non-land cards.
-- Standard / Modern / Pioneer / Legacy / Vintage / Pauper: minimum 60 cards. Max 4 copies of any non-basic land card.
-- Draft / Sealed: minimum 40 cards.
+To start a new Commander build you need exactly two things:
+1. Commander name
+2. Budget (e.g. "under $50", "no limit", "only cards I own")
+If either is missing, ask for both in one message.
+
+BUILD WORKFLOW — follow these steps in order, every time:
+
+Step 1 — call get_commander_guide with the commander name AND the correct budget_tier:
+  - budget  → user budget is under ~$50
+  - average → user budget is roughly $50–$300 (default if no budget stated)
+  - expensive → user budget is over ~$300 or "no limit"
+  This returns an EDHREC deck tuned for that price range: a human-curated 100-card baseline that is already color-legal and properly structured.
+  If EDHREC data is not found for that tier, the tool falls back to the average tier automatically.
+
+Step 2 — call get_collection (filtered to the commander's colors and "commander" format).
+  - Do this once. Do not repeat it.
+
+Step 3 — build the final 100-card list:
+
+  ── PATH A: EDHREC baseline available ──
+  a. START with every card in the EDHREC list (it is already 100 cards including the commander).
+  b. For each EDHREC card the user OWNS: keep it as-is.
+  c. For each EDHREC card the user does NOT own:
+       - First try to substitute with an owned card that serves the same role.
+       - If no suitable owned substitute: keep the original card (the user will buy it).
+       - Only search for cheaper alternatives if the user gave an explicit budget AND the card exceeds it.
+  d. After substitutions the deck is still 100 cards. Do not pad with lands.
+
+  ── PATH B: No EDHREC data ──
+  Build a full 100-card list from your own knowledge using this exact structure:
+    1  commander (with role "commander")
+   10  ramp cards (Sol Ring, Arcane Signet, Mind Stone, Fellwar Stone, Thought Vessel, Worn Powerstone, Hedron Archive, Gilded Lotus, Thran Dynamo, Commander's Sphere, …)
+   10  card draw spells (Rhystic Study, Mystic Remora, Phyrexian Arena, Necropotence, Read the Bones, Sign in Blood, Night's Whisper, Painful Truths, Thorough Investigation, Wheels, …)
+    6  targeted removal
+    3  board wipes
+    4  counterspells (for blue commanders)
+   28  other on-theme spells, creatures, and artifacts that fit the strategy
+   38  lands (basic lands + Command Tower + a handful of utility lands)
+  ─────
+  100  TOTAL
+
+  Mentally count your list to 100 before calling propose_deck. You know hundreds of real card names — write them all out. Do NOT call propose_deck until you have exactly 100 named.
+
+Step 4 — call propose_deck with the complete 100-card list.
+  - Do not call propose_deck until your count is exactly 100.
+  - Set color_identity to the commander's color identity.
+  - Set format to "commander".
+  - Include the commander card with role "commander".
+
+IMPORTANT — tool economy:
+- get_collection once, get_commander_guide once. Then go straight to Step 3.
+- Only use search_scryfall when you are genuinely unsure of an exact card name — not to discover new cards to fill slots.
+- After a propose_deck rejection, make surgical fixes only. Do not restart.
+
+═══════════════════════════════════════
+DECK RULES (enforced server-side)
+═══════════════════════════════════════
+
+Card count: exactly 100 cards. Commander counts as 1 of the 100.
+Singleton: max 1 copy of every non-basic-land card.
+Basic lands (Plains, Island, Swamp, Mountain, Forest, Wastes, Snow-Covered basics) may appear in any quantity.
+Land count: target 36–38 total (hard max 40). NEVER more than 25 of any single basic land type.
+Non-land cards: you need at least 62 spells/creatures/artifacts. A 100-card deck with fewer than 62 non-lands is unplayable — do not pad missing slots with basic lands.
+
+Color identity (STRICTLY enforced):
+- Always pass `color_identity` in propose_deck — use the commander's color identity.
+- Every non-colorless card MUST have a color identity that is a subset of the commander's colors. No exceptions.
+- Colorless cards and artifacts with no color identity are always allowed.
 
 CRITICAL — card_name rules for propose_deck:
-- Every card_name MUST be a real, specific Magic: The Gathering card name exactly as printed on the card.
-  CORRECT: "Lightning Bolt", "Counterspell", "Sol Ring", "Island", "Scalding Tarn", "Steam Vents"
-  WRONG: "Discard spells", "Fetch lands", "Fetch lands (e.g., Scalding Tarn)", "Basic lands", "Shock lands", "Other blue spells", "Removal spells"
-- NEVER use category names, descriptions, or parenthetical examples as a card_name. If you need fetch lands, name each one individually: "Scalding Tarn", "Flooded Strand", etc. If you need basic lands, list each one: "Island", "Mountain", "Plains", etc.
-- If you are unsure of a card's exact name, use search_scryfall to confirm it before including it in propose_deck.
+- Every card_name MUST be an exact printed Magic card name: "Sol Ring", "Lightning Bolt", "Island".
+- NEVER use category names: "Ramp spell", "Fetch land (e.g. Scalding Tarn)", "Removal", etc.
+- If unsure of an exact name, use search_scryfall to confirm it first.
 
-Rules:
-- First decide whether the user wants to build a new deck, improve an existing deck, or figure out what to buy for an existing deck.
-- For a brand-new deck, require all of the following before calling tools:
-    1. Format (e.g. Commander, Modern, Standard)
-    2. Playstyle / archetype (e.g. aggro, control, combo, midrange, tokens, ramp)
-    3. Budget (e.g. "under $50", "no budget", "use only cards I own")
-  If any are missing or too vague, ask for them all in one message. Do not guess defaults.
-- For improving or buying cards for an existing deck, call get_active_deck early if a deck is attached to the conversation.
-- If the user refers to "this deck" or "my deck" but no deck is attached, ask them to open the deck and start the chat from there, or provide the deck name.
-- Once you have enough info for the task, call the relevant tools immediately and start analyzing.
-- For deck improvement, tuning, swap suggestions, and buy recommendations, prefer propose_changes. Do NOT call propose_deck unless the user explicitly asks for a full rebuilt deck list.
-- For Commander decks: call get_commander_guide with the commander name right after get_collection. Use the returned card list as a reference for what staples and support packages experienced players include. Adapt it to the user's collection and budget — don't copy it blindly.
-- Prioritize cards the user owns (they cost $0 extra). Use search_cards to fill gaps from the local database.
-- Budget enforcement: every card in get_collection, search_cards, and search_scryfall results includes a price_usd field (USD, null means unknown). When the user gives a budget, track the running total as you select cards. Do not include any card whose price_usd would cause the total to exceed the budget. If a card's price_usd is null, treat it as $0 for budget purposes. Prefer cheaper alternatives when a card is over budget.
-- When improving an existing deck, compare the active deck against the user's collection and clearly separate:
-    1. cuts
-    2. cards the user already owns and can swap in now
-    3. cards worth buying
-- When the user asks what to buy, prioritize cards they do not already own and mention cheaper alternatives when useful.
-- When the user mentions a specific card they don't own, or when a card is not found locally, use search_scryfall to look it up and get its full details before recommending it.
-- When using propose_changes, keep the recommendation focused and compact. Only include the cards that should change, not the entire deck.
-- Always verify your card count matches the format requirement before calling propose_deck. If you are short, use search_scryfall to find more cards to fill the deck.
-- When you have a complete card list that meets the deck size requirement, call propose_deck. Do not describe what you are about to do — just do it.
+Repair (when propose_deck returns a count error):
+- The error message tells you the FILL BREAKDOWN: exactly how many spells and how many lands to add.
+- Follow that breakdown precisely. Do NOT substitute all-lands for all-spells.
+- To add spells: name real cards from your own knowledge (e.g. Opt, Consider, Preordain, Serum Visions, Arcane Denial, Negate, Swan Song, Into the Roil, Capsize, Ponder, Brainstorm, Impulse, Frantic Search, Mana Leak, etc.). You do NOT need to call search_scryfall for well-known cards.
+- Only call search_scryfall if you genuinely cannot recall an exact card name — not to discover filler cards.
+- Only add basic lands if the FILL BREAKDOWN says to. Never add more than the allowed number of lands.
+
+Budget:
+- price_usd is included on every card. Track the running buy total as you select unowned cards.
+- Cards the user owns cost $0. Cards with null price_usd are treated as $0.
+- Never exceed the stated budget on bought cards.
+
+═══════════════════════════════════════
+IMPROVING AN EXISTING DECK
+═══════════════════════════════════════
+
+- Call get_active_deck early if a deck is attached to the conversation.
+- If the user refers to "this deck" but no deck is attached, ask them to open the deck first.
+- Prefer propose_changes for tuning, swaps, and buy recommendations. Only use propose_deck if the user explicitly asks for a full rebuild.
+- When improving, clearly separate: (1) cuts, (2) owned cards to swap in, (3) cards worth buying.
+- When the user asks what to buy, prioritize what they don't own and offer cheaper alternatives.
+
+═══════════════════════════════════════
+GENERAL
+═══════════════════════════════════════
+
 - Keep conversational text short and direct.
+- When you have a complete card list ready, call propose_deck immediately — do not describe what you are about to do.
 
 {$deckContext}
 PROMPT;

@@ -5,6 +5,7 @@ namespace Tests\Feature;
 use App\Models\Card;
 use App\Models\Conversation;
 use App\Models\Deck;
+use App\Models\Message;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
@@ -94,6 +95,75 @@ class AiDeckBuilderTest extends TestCase
         ]);
     }
 
+    public function test_create_deck_rejects_invalid_assistant_proposal(): void
+    {
+        $message = Message::create([
+            'conversation_id' => $this->conversation->id,
+            'role' => 'assistant',
+            'content' => 'Rejected deck.',
+            'metadata' => [
+                'proposal_type' => 'deck',
+                'deck_name' => 'Broken Scarab Deck',
+                'format' => 'commander',
+                'strategy_summary' => 'Invalid list.',
+                'cards' => [],
+                'draft_deck_id' => null,
+                'validation_message' => 'Deck rejected: commander requires exactly 100 cards.',
+            ],
+        ]);
+
+        $response = $this->actingAs($this->user)
+            ->postJson("/api/chat/conversations/{$this->conversation->id}/create-deck", [
+                'message_id' => $message->id,
+            ]);
+
+        $response->assertStatus(422);
+        $response->assertJsonPath('message', 'Deck rejected: commander requires exactly 100 cards.');
+        $this->assertDatabaseCount('decks', 0);
+    }
+
+    public function test_create_deck_uses_valid_assistant_message_metadata(): void
+    {
+        $island = Card::factory()->create(['name' => 'Island']);
+        $opt = Card::factory()->create(['name' => 'Opt']);
+
+        $message = Message::create([
+            'conversation_id' => $this->conversation->id,
+            'role' => 'assistant',
+            'content' => 'Valid deck.',
+            'metadata' => [
+                'proposal_type' => 'deck',
+                'deck_name' => 'Blue Tempo',
+                'format' => 'standard',
+                'strategy_summary' => 'Tempo shell.',
+                'cards' => [
+                    ['card_id' => $island->id, 'quantity' => 20],
+                    ['card_id' => $opt->id, 'quantity' => 4],
+                ],
+                'draft_deck_id' => null,
+                'validation_message' => null,
+            ],
+        ]);
+
+        $response = $this->actingAs($this->user)
+            ->postJson("/api/chat/conversations/{$this->conversation->id}/create-deck", [
+                'message_id' => $message->id,
+            ]);
+
+        $response->assertCreated();
+        $this->assertDatabaseHas('decks', [
+            'user_id' => $this->user->id,
+            'name' => 'Blue Tempo',
+            'format' => 'standard',
+            'is_draft' => false,
+        ]);
+        $this->assertDatabaseHas('deck_cards', [
+            'deck_id' => $response->json('id'),
+            'card_id' => $island->id,
+            'quantity' => 20,
+        ]);
+    }
+
     // -------------------------------------------------------------------------
     // Missing info
     // -------------------------------------------------------------------------
@@ -129,6 +199,11 @@ class AiDeckBuilderTest extends TestCase
 
     public function test_full_deck_build_flow_proposes_and_saves_draft(): void
     {
+        // Attach a deck so the conversation runs as an improvement session
+        // (new builds are commander-only; improvement sessions allow any format).
+        $deck = Deck::factory()->create(['user_id' => $this->user->id, 'format' => 'standard']);
+        $this->conversation->update(['deck_id' => $deck->id]);
+
         // Arrange — 20 Islands + 10 non-land cards × 4 copies = 60 cards
         $this->makeCard('Island', 'Basic Land — Island', 20);
 
@@ -221,6 +296,11 @@ class AiDeckBuilderTest extends TestCase
 
     public function test_propose_deck_is_retried_when_card_count_is_wrong(): void
     {
+        // Attach a deck so the conversation runs as an improvement session
+        // (new builds are commander-only; improvement sessions allow any format).
+        $deck = Deck::factory()->create(['user_id' => $this->user->id, 'format' => 'standard']);
+        $this->conversation->update(['deck_id' => $deck->id]);
+
         // Create the cards that will be in the valid second proposal
         $this->makeCard('Island', 'Basic Land — Island', 20);
 
@@ -268,9 +348,341 @@ class AiDeckBuilderTest extends TestCase
         $response->assertOk();
         $this->assertNotNull($response->json('deck_proposal'));
 
-        // Only one draft saved (the valid one from call_2)
-        $this->assertDatabaseCount('decks', 1);
+        // Only one draft saved (the valid one from call_2); plus the attached improvement deck = 2 total
+        $this->assertDatabaseCount('decks', 2);
         $this->assertDatabaseHas('decks', ['is_draft' => true]);
+    }
+
+    public function test_new_deck_build_exits_gracefully_when_search_loop_repeats(): void
+    {
+        $this->makeCard('Krenko, Mob Boss', 'Legendary Creature — Goblin Warrior', 0, priceUsd: 5.00);
+        $this->makeCard('Goblin Chieftain', 'Creature — Goblin', 0, priceUsd: 2.00);
+        $this->makeCard('Goblin Trashmaster', 'Creature — Goblin Warrior', 0, priceUsd: 1.00);
+        $this->makeCard('Mountain', 'Basic Land — Mountain', 0, priceUsd: 0.05);
+
+        $shortDeck = [
+            ['card_name' => 'Krenko, Mob Boss', 'quantity' => 1, 'role' => 'commander'],
+            ['card_name' => 'Goblin Chieftain', 'quantity' => 1, 'role' => 'anthem'],
+            ['card_name' => 'Mountain', 'quantity' => 34, 'role' => 'land'],
+        ];
+
+        Http::fake([
+            'https://api.openai.com/*' => Http::sequence()
+                ->push($this->toolCallResponse('propose_deck', [
+                    'deck_name' => 'Krenko Aggro',
+                    'format' => 'commander',
+                    'cards' => $shortDeck,
+                ], 'call_1'), 200)
+                ->push($this->toolCallResponse('search_cards', [
+                    'query' => 'goblin',
+                    'colors' => ['R'],
+                    'format' => 'commander',
+                ], 'call_2'), 200)
+                ->push($this->toolCallResponse('propose_deck', [
+                    'deck_name' => 'Krenko Aggro',
+                    'format' => 'commander',
+                    'cards' => array_merge($shortDeck, [
+                        ['card_name' => 'Goblin Trashmaster', 'quantity' => 1, 'role' => 'payoff'],
+                    ]),
+                ], 'call_3'), 200)
+                ->push($this->toolCallResponse('search_cards', [
+                    'query' => 'goblin',
+                    'colors' => ['R'],
+                    'format' => 'commander',
+                ], 'call_4'), 200),
+            'https://api.scryfall.com/*' => Http::response([], 404),
+        ]);
+
+        $response = $this->actingAs($this->user)
+            ->postJson("/api/chat/conversations/{$this->conversation->id}/messages", [
+                'message' => 'Build me a Krenko commander deck under $100',
+            ]);
+
+        $response->assertOk();
+        $this->assertNotNull($response->json('deck_proposal'));
+        $response->assertJsonPath('deck_proposal.draft_deck_id', null);
+        $this->assertNotNull($response->json('deck_proposal.validation_message'));
+        $this->assertStringContainsString(
+            'looping on the same search',
+            $response->json('message.content')
+        );
+    }
+
+    public function test_new_deck_build_exits_gracefully_when_max_rounds_are_spent_on_searches(): void
+    {
+        $this->makeCard('Krenko, Mob Boss', 'Legendary Creature — Goblin Warrior', 0, priceUsd: 5.00);
+        $this->makeCard('Mountain', 'Basic Land — Mountain', 0, priceUsd: 0.05);
+        $this->makeCard('Sol Ring', 'Artifact', 0, priceUsd: 1.50);
+
+        Http::fake([
+            'https://api.openai.com/*' => Http::sequence()
+                ->push($this->toolCallResponse('get_collection', ['colors' => ['R'], 'format' => 'commander'], 'call_1'), 200)
+                ->push($this->toolCallResponse('get_commander_guide', ['commander_name' => 'Krenko, Mob Boss'], 'call_2'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'goblin', 'colors' => ['R'], 'format' => 'commander'], 'call_3'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'artifact ramp', 'colors' => ['R'], 'format' => 'commander'], 'call_4'), 200)
+                ->push($this->toolCallResponse('search_scryfall', ['query' => 'krenko goblin commander tokens'], 'call_5'), 200)
+                ->push($this->toolCallResponse('search_scryfall', ['query' => 'mana rock red commander'], 'call_6'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'mana rock', 'colors' => ['R'], 'format' => 'commander'], 'call_7'), 200)
+                ->push($this->toolCallResponse('search_scryfall', ['query' => 'krenko mob boss commander decklist'], 'call_8'), 200)
+                ->push($this->toolCallResponse('propose_deck', [
+                    'deck_name' => 'Krenko Aggro',
+                    'format' => 'commander',
+                    'cards' => [
+                        ['card_name' => 'Krenko, Mob Boss', 'quantity' => 1, 'role' => 'commander'],
+                        ['card_name' => 'Mountain', 'quantity' => 35, 'role' => 'land'],
+                        ['card_name' => 'Sol Ring', 'quantity' => 1, 'role' => 'ramp'],
+                    ],
+                ], 'call_9'), 200)
+                ->push($this->toolCallResponse('search_scryfall', ['query' => 'mono red commander draw goblin'], 'call_10'), 200)
+                ->push($this->toolCallResponse('search_scryfall', ['query' => 'red goblin token payoff'], 'call_11'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'goblin token', 'colors' => ['R'], 'format' => 'commander'], 'call_12'), 200)
+                ->push($this->toolCallResponse('search_scryfall', ['query' => 'commander goblin token draw red'], 'call_13'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'red draw', 'colors' => ['R'], 'format' => 'commander'], 'call_14'), 200)
+                ->push($this->toolCallResponse('search_scryfall', ['query' => 'mono red goblin haste payoff'], 'call_15'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'goblin haste', 'colors' => ['R'], 'format' => 'commander'], 'call_16'), 200)
+                ->push($this->toolCallResponse('search_scryfall', ['query' => 'mono red commander goblin finisher'], 'call_17'), 200),
+            'https://api.scryfall.com/*' => Http::response([], 404),
+        ]);
+
+        $response = $this->actingAs($this->user)
+            ->postJson("/api/chat/conversations/{$this->conversation->id}/messages", [
+                'message' => 'Help me build a Krenko commander deck under $250',
+            ]);
+
+        $response->assertOk();
+        $this->assertNotNull($response->json('deck_proposal'));
+        $this->assertNull($response->json('deck_proposal.draft_deck_id'));
+        $this->assertNotNull($response->json('deck_proposal.validation_message'));
+        $this->assertStringContainsString(
+            'stopped before wasting more tool calls',
+            strtolower($response->json('message.content'))
+        );
+    }
+
+    public function test_new_deck_build_uses_higher_round_cap_before_graceful_fallback(): void
+    {
+        Http::fake([
+            'https://api.openai.com/*' => Http::sequence()
+                ->push($this->toolCallResponse('get_collection', [], 'call_1'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'tempo', 'format' => 'standard'], 'call_2'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'draw', 'format' => 'standard'], 'call_3'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'removal', 'format' => 'standard'], 'call_4'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'counterspell', 'format' => 'standard'], 'call_5'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'cheap flyers', 'format' => 'standard'], 'call_6'), 200)
+                ->push($this->toolCallResponse('search_scryfall', ['query' => 'f:standard tempo'], 'call_7'), 200)
+                ->push($this->toolCallResponse('search_scryfall', ['query' => 'f:standard draw spell'], 'call_8'), 200)
+                ->push($this->toolCallResponse('search_scryfall', ['query' => 'f:standard instant removal'], 'call_9'), 200)
+                ->push($this->toolCallResponse('search_scryfall', ['query' => 'f:standard cheap blue creature'], 'call_10'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'bounce', 'format' => 'standard'], 'call_11'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'cantrip', 'format' => 'standard'], 'call_12'), 200)
+                ->push($this->toolCallResponse('search_scryfall', ['query' => 'f:standard one mana trick'], 'call_13'), 200)
+                ->push($this->toolCallResponse('search_scryfall', ['query' => 'f:standard sideboard hate'], 'call_14'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'dual land', 'format' => 'standard'], 'call_15'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'finisher', 'format' => 'standard'], 'call_16'), 200)
+                ->push($this->toolCallResponse('search_scryfall', ['query' => 'f:standard tempo finisher'], 'call_17'), 200),
+        ]);
+
+        $response = $this->actingAs($this->user)
+            ->postJson("/api/chat/conversations/{$this->conversation->id}/messages", [
+                'message' => 'Build me a new standard tempo deck.',
+            ]);
+
+        $response->assertOk();
+        $this->assertStringContainsString(
+            'stopped before wasting more tool calls',
+            strtolower($response->json('message.content'))
+        );
+    }
+
+    public function test_new_deck_build_gets_repair_rounds_after_invalid_proposal(): void
+    {
+        $this->makeCard('Syr Konrad, the Grim', 'Legendary Creature — Human Knight', 0, priceUsd: 1.50)
+            ->update(['color_identity' => ['B']]);
+        $this->makeCard('Swamp', 'Basic Land — Swamp', 0, priceUsd: 0.05)
+            ->update(['color_identity' => ['B']]);
+        $this->makeCard('Hapatra, Vizier of Poisons', 'Legendary Creature — Human Cleric', 0, priceUsd: 0.50)
+            ->update(['color_identity' => ['B', 'G']]);
+        $this->makeCard('Murder', 'Instant', 0, priceUsd: 0.10)
+            ->update(['color_identity' => ['B']]);
+
+        Http::fake([
+            'https://api.openai.com/*' => Http::sequence()
+                ->push($this->toolCallResponse('get_collection', ['colors' => ['B'], 'format' => 'commander'], 'call_1'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'draw', 'colors' => ['B'], 'format' => 'commander'], 'call_2'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'ramp', 'colors' => ['B'], 'format' => 'commander'], 'call_3'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'tokens', 'colors' => ['B'], 'format' => 'commander'], 'call_4'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'sacrifice', 'colors' => ['B'], 'format' => 'commander'], 'call_5'), 200)
+                ->push($this->toolCallResponse('search_scryfall', ['query' => 'mono black commander draw'], 'call_6'), 200)
+                ->push($this->toolCallResponse('search_scryfall', ['query' => 'mono black sacrifice outlet'], 'call_7'), 200)
+                ->push($this->toolCallResponse('search_scryfall', ['query' => 'mono black commander payoff'], 'call_8'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'graveyard', 'colors' => ['B'], 'format' => 'commander'], 'call_9'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'zombie', 'colors' => ['B'], 'format' => 'commander'], 'call_10'), 200)
+                ->push($this->toolCallResponse('propose_deck', [
+                    'deck_name' => 'Syr Konrad Combo',
+                    'format' => 'commander',
+                    'cards' => [
+                        ['card_name' => 'Syr Konrad, the Grim', 'quantity' => 1, 'role' => 'commander'],
+                        ['card_name' => 'Swamp', 'quantity' => 36, 'role' => 'land'],
+                        ['card_name' => 'Hapatra, Vizier of Poisons', 'quantity' => 1, 'role' => 'combo_piece'],
+                    ],
+                ], 'call_11'), 200)
+                ->push($this->toolCallResponse('propose_changes', [
+                    'deck_name' => 'Syr Konrad Combo',
+                    'format' => 'commander',
+                    'removed_cards' => [
+                        ['card_name' => 'Hapatra, Vizier of Poisons', 'quantity' => 1, 'role' => 'combo_piece'],
+                    ],
+                    'added_cards' => [
+                        ['card_name' => 'Murder', 'quantity' => 1, 'role' => 'interaction'],
+                    ],
+                ], 'call_12'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'creature', 'colors' => ['B'], 'format' => 'commander'], 'call_13'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'removal', 'colors' => ['B'], 'format' => 'commander'], 'call_14'), 200)
+                // Two extra repair rounds to exhaust MAX_REPAIR_ROUNDS_PER_PROPOSAL (now 5)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'discard', 'colors' => ['B'], 'format' => 'commander'], 'call_15'), 200)
+                ->push($this->toolCallResponse('search_cards', ['query' => 'tutor', 'colors' => ['B'], 'format' => 'commander'], 'call_16'), 200),
+            'https://api.scryfall.com/*' => Http::response([], 404),
+        ]);
+
+        $response = $this->actingAs($this->user)
+            ->postJson("/api/chat/conversations/{$this->conversation->id}/messages", [
+                'message' => 'Build me a mono-black Syr Konrad commander deck.',
+            ]);
+
+        $response->assertOk();
+        $this->assertStringContainsString(
+            'repair budget',
+            strtolower($response->json('message.content'))
+        );
+        $this->assertNull($response->json('deck_proposal.draft_deck_id'));
+        $this->assertStringContainsString(
+            'color identity violation',
+            strtolower($response->json('deck_proposal.validation_message'))
+        );
+    }
+
+    public function test_short_count_repair_mode_blocks_exploratory_searches(): void
+    {
+        $this->makeCard('Syr Konrad, the Grim', 'Legendary Creature — Human Knight', 0, priceUsd: 1.50)
+            ->update(['color_identity' => ['B']]);
+        $this->makeCard('Swamp', 'Basic Land — Swamp', 0, priceUsd: 0.05)
+            ->update(['color_identity' => ['B']]);
+
+        Http::fake([
+            'https://api.openai.com/*' => Http::sequence()
+                ->push($this->toolCallResponse('propose_deck', [
+                    'deck_name' => 'Syr Konrad Combo',
+                    'format' => 'commander',
+                    'cards' => [
+                        ['card_name' => 'Syr Konrad, the Grim', 'quantity' => 1, 'role' => 'commander'],
+                        ['card_name' => 'Swamp', 'quantity' => 63, 'role' => 'land'],
+                    ],
+                ], 'call_1'), 200)
+                ->push($this->toolCallResponse('search_cards', [
+                    'query' => 'zombie',
+                    'colors' => ['B'],
+                    'format' => 'commander',
+                ], 'call_2'), 200)
+                ->push($this->textResponse('I need to repair the list.'), 200),
+            'https://api.scryfall.com/*' => Http::response([], 404),
+        ]);
+
+        $response = $this->actingAs($this->user)
+            ->postJson("/api/chat/conversations/{$this->conversation->id}/messages", [
+                'message' => 'Build me a mono-black Syr Konrad commander deck.',
+            ]);
+
+        $response->assertOk();
+
+        $toolMessages = $this->conversation->fresh()->messages()->where('role', 'tool')->get();
+        $searchToolPayload = json_decode($toolMessages->last()->content, true);
+
+        $this->assertIsArray($searchToolPayload);
+        $this->assertStringContainsString('Repair mode', $searchToolPayload['error'] ?? '');
+        $this->assertStringContainsString('short by 36', strtolower($searchToolPayload['error'] ?? ''));
+    }
+
+    public function test_commander_deck_rejects_cards_outside_commanders_color_identity(): void
+    {
+        $this->makeCard('Syr Konrad, the Grim', 'Legendary Creature — Human Knight', 0, priceUsd: 1.50)
+            ->update(['color_identity' => ['B']]);
+        $this->makeCard('Swamp', 'Basic Land — Swamp', 0, priceUsd: 0.05)
+            ->update(['color_identity' => ['B']]);
+        $this->makeCard('Lightning Bolt', 'Instant', 0, priceUsd: 1.00)
+            ->update(['color_identity' => ['R']]);
+        $this->makeCard('Counterspell', 'Instant', 0, priceUsd: 1.00)
+            ->update(['color_identity' => ['U']]);
+
+        Http::fake([
+            'https://api.openai.com/*' => Http::sequence()
+                ->push($this->toolCallResponse('propose_deck', [
+                    'deck_name' => 'Syr Konrad Drain',
+                    'format' => 'commander',
+                    'cards' => [
+                        ['card_name' => 'Syr Konrad, the Grim', 'quantity' => 1, 'role' => 'commander'],
+                        ['card_name' => 'Swamp', 'quantity' => 36, 'role' => 'land'],
+                        ['card_name' => 'Lightning Bolt', 'quantity' => 1, 'role' => 'removal'],
+                        ['card_name' => 'Counterspell', 'quantity' => 1, 'role' => 'interaction'],
+                    ],
+                ], 'call_1'), 200)
+                ->push($this->textResponse('I will rebuild this as a legal mono-black list.'), 200),
+            'https://api.scryfall.com/*' => Http::response([], 404),
+        ]);
+
+        $response = $this->actingAs($this->user)
+            ->postJson("/api/chat/conversations/{$this->conversation->id}/messages", [
+                'message' => 'Build me a Syr Konrad commander deck',
+            ]);
+
+        $response->assertOk();
+        $this->assertNotNull($response->json('deck_proposal'));
+        $this->assertStringContainsString(
+            'color identity violation',
+            strtolower($response->json('deck_proposal.validation_message'))
+        );
+        $this->assertStringContainsString(
+            'Lightning Bolt',
+            $response->json('deck_proposal.validation_message')
+        );
+        $this->assertStringContainsString(
+            'Counterspell',
+            $response->json('deck_proposal.validation_message')
+        );
+    }
+
+    public function test_commander_guide_returns_commander_card_data_even_without_sample_deck(): void
+    {
+        Card::factory()->create([
+            'name' => 'Syr Konrad, the Grim',
+            'type_line' => 'Legendary Creature — Human Knight',
+            'mana_cost' => '{3}{B}{B}',
+            'color_identity' => ['B'],
+            'oracle_text' => 'Whenever another creature dies, or a creature card is put into a graveyard from anywhere other than the battlefield, or a creature card leaves your graveyard, Syr Konrad, the Grim deals 1 damage to each opponent.',
+        ]);
+
+        Http::fake([
+            'https://api.openai.com/*' => Http::sequence()
+                ->push($this->toolCallResponse('get_commander_guide', [
+                    'commander_name' => 'Syr Konrad, the Grim',
+                ], 'call_1'), 200)
+                ->push($this->textResponse('I see Syr Konrad is mono-black.'), 200),
+            'https://api.scryfall.com/*' => Http::response([], 404),
+        ]);
+
+        $response = $this->actingAs($this->user)
+            ->postJson("/api/chat/conversations/{$this->conversation->id}/messages", [
+                'message' => 'Build me a Syr Konrad commander deck under $100',
+            ]);
+
+        $response->assertOk();
+
+        $toolMessage = $this->conversation->fresh()->messages()->where('role', 'tool')->first();
+        $this->assertNotNull($toolMessage);
+
+        $payload = json_decode($toolMessage->content, true);
+        $this->assertFalse($payload['found']);
+        $this->assertEquals(['B'], $payload['commander']['color_identity']);
+        $this->assertEquals('Syr Konrad, the Grim', $payload['commander']['name']);
     }
 
     public function test_existing_deck_context_can_be_loaded_for_upgrade_advice(): void
@@ -404,6 +816,7 @@ class AiDeckBuilderTest extends TestCase
                     ],
                 ], 'call_2'), 200)
                 ->push($this->textResponse('Swap Cancel for Counterspell.'), 200),
+            'https://api.scryfall.com/*' => Http::response(['object' => 'error', 'code' => 'not_found'], 404),
         ]);
 
         $response = $this->actingAs($this->user)

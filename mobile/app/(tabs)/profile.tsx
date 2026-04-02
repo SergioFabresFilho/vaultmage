@@ -1,4 +1,5 @@
 import { useAuth } from '@/context/AuthContext';
+import { API_BASE_URL, API_CONNECTION_HELP } from '@/lib/api';
 import { useRouter } from 'expo-router';
 import { useEffect, useState } from 'react';
 import {
@@ -11,8 +12,6 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-
-const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:8000';
 
 type User = {
   id: number;
@@ -49,7 +48,7 @@ export default function ProfileScreen() {
           Alert.alert('Error', 'Failed to fetch user data.');
         }
       } catch (err) {
-        Alert.alert('Error', 'Could not connect to server.');
+        Alert.alert('Error', API_CONNECTION_HELP);
       } finally {
         setLoading(false);
       }

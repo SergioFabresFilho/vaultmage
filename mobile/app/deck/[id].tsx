@@ -1,3 +1,4 @@
+import { API_BASE_URL } from '@/lib/api';
 import { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
@@ -16,7 +17,6 @@ import { useLocalSearchParams, useRouter } from 'expo-router';
 import { SvgUri } from 'react-native-svg';
 import { useAuth } from '@/context/AuthContext';
 
-const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:8000';
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
 const FORMATS: Record<string, string> = {
@@ -54,6 +54,7 @@ type Card = {
   pivot: {
     quantity: number;
     is_sideboard: boolean;
+    is_commander: boolean;
   };
 };
 
@@ -101,8 +102,10 @@ function getCardType(typeLine: string): string {
   return 'Other';
 }
 
-function buildSections(cards: Card[]): Section[] {
-  const mainboard = cards.filter((c) => !c.pivot.is_sideboard);
+function buildSections(cards: Card[], format?: string | null): Section[] {
+  const isCommander = format === 'commander' || format === 'edh';
+  const commanders = isCommander ? cards.filter((c) => !c.pivot.is_sideboard && c.pivot.is_commander) : [];
+  const mainboard = cards.filter((c) => !c.pivot.is_sideboard && !c.pivot.is_commander);
   const sideboard = cards.filter((c) => !!c.pivot.is_sideboard);
 
   const grouped: Record<string, Card[]> = {};
@@ -112,10 +115,21 @@ function buildSections(cards: Card[]): Section[] {
     grouped[type].push(card);
   }
 
-  const sections: Section[] = TYPE_ORDER.filter((t) => grouped[t]?.length > 0).map((t) => ({
-    title: `${t === 'Sorcery' ? 'Sorceries' : `${t}s`} (${grouped[t].reduce((sum, c) => sum + c.pivot.quantity, 0)})`,
-    data: grouped[t].sort((a, b) => a.name.localeCompare(b.name)),
-  }));
+  const sections: Section[] = [];
+
+  if (commanders.length > 0) {
+    sections.push({
+      title: `Commander (${commanders.reduce((sum, c) => sum + c.pivot.quantity, 0)})`,
+      data: commanders.sort((a, b) => a.name.localeCompare(b.name)),
+    });
+  }
+
+  TYPE_ORDER.filter((t) => grouped[t]?.length > 0).forEach((t) => {
+    sections.push({
+      title: `${t === 'Sorcery' ? 'Sorceries' : `${t}s`} (${grouped[t].reduce((sum, c) => sum + c.pivot.quantity, 0)})`,
+      data: grouped[t].sort((a, b) => a.name.localeCompare(b.name)),
+    });
+  });
 
   if (sideboard.length > 0) {
     sections.push({
@@ -211,7 +225,7 @@ export default function DeckViewScreen() {
 
   const totalCards = deck?.cards.reduce((sum, c) => sum + c.pivot.quantity, 0) ?? 0;
   const totalPrice = deck?.cards.reduce((sum, c) => sum + (c.price_usd ?? 0) * c.pivot.quantity, 0) ?? 0;
-  const sections = deck ? buildSections(deck.cards) : [];
+  const sections = deck ? buildSections(deck.cards, deck.format) : [];
 
   if (loading) {
     return (

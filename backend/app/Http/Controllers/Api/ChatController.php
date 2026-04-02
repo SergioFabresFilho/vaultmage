@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Conversation;
 use App\Models\Deck;
+use App\Models\Message;
 use App\Services\AiChatService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -129,6 +130,7 @@ class ChatController extends Controller
                         echo 'data: ' . json_encode([
                             'type'          => 'done',
                             'message_id'    => $data['message_id'],
+                            'content'       => $data['content'] ?? '',
                             'deck_proposal' => $data['deck_proposal'],
                         ]) . "\n\n";
                     } elseif ($type === 'error') {
@@ -151,28 +153,45 @@ class ChatController extends Controller
         $this->authorizeConversation($request, $conversation);
 
         $request->validate([
-            'deck_name'        => 'required|string|max:255',
-            'format'           => 'nullable|string|max:50',
-            'strategy_summary' => 'nullable|string|max:500',
-            'cards'            => 'required|array|min:1',
-            'cards.*.card_id'  => 'required|integer|exists:cards,id',
-            'cards.*.quantity' => 'required|integer|min:1|max:99',
+            'message_id' => 'required|integer|exists:messages,id',
         ]);
 
-        $deck = Deck::create([
-            'user_id'     => $request->user()->id,
-            'name'        => $request->input('deck_name'),
-            'format'      => $request->input('format'),
-            'description' => $request->input('strategy_summary'),
-        ]);
+        $message = Message::where('id', $request->integer('message_id'))
+            ->where('role', 'assistant')
+            ->where('conversation_id', $conversation->id)
+            ->firstOrFail();
 
-        $syncData = collect($request->input('cards'))
+        $proposal = $message->metadata;
+        if (! is_array($proposal) || ($proposal['proposal_type'] ?? null) !== 'deck') {
+            return response()->json(['message' => 'No deck proposal found for that message.'], 422);
+        }
+
+        if (! empty($proposal['validation_message'])) {
+            return response()->json(['message' => $proposal['validation_message']], 422);
+        }
+
+        $cards = collect($proposal['cards'] ?? [])
+            ->filter(fn ($entry) => ! empty($entry['card_id']) && (int) ($entry['quantity'] ?? 0) >= 1)
             ->mapWithKeys(fn ($entry) => [
-                $entry['card_id'] => ['quantity' => $entry['quantity'], 'is_sideboard' => false],
+                (int) $entry['card_id'] => [
+                    'quantity'     => (int) $entry['quantity'],
+                    'is_sideboard' => false,
+                    'is_commander' => ($entry['role'] ?? '') === 'commander',
+                ],
             ])
             ->all();
 
-        $deck->cards()->sync($syncData);
+        if ($cards === []) {
+            return response()->json(['message' => 'This proposal has no valid cards to create a deck from.'], 422);
+        }
+
+        $deck = Deck::create([
+            'user_id'     => $request->user()->id,
+            'name'        => $proposal['deck_name'] ?? 'New Deck',
+            'format'      => $proposal['format'] ?? null,
+            'description' => $proposal['strategy_summary'] ?? null,
+        ]);
+        $deck->cards()->sync($cards);
 
         return response()->json($deck, 201);
     }

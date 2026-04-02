@@ -21,6 +21,13 @@ class FetchCommanderAverageDeck implements ShouldQueue
 
     private const AVG_DECK_URL = 'https://json.edhrec.com/pages/average-decks/%s.json';
 
+    /** EDHREC slug suffixes for non-average tiers */
+    private const TIER_SUFFIXES = [
+        'budget'    => '-budget',
+        'expensive' => '-expensive',
+        'average'   => '',
+    ];
+
     private const HEADERS = [
         'User-Agent' => 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Referer'    => 'https://edhrec.com/',
@@ -30,6 +37,7 @@ class FetchCommanderAverageDeck implements ShouldQueue
     public function __construct(
         public readonly string $commanderName,
         public readonly string $commanderSlug,
+        public readonly string $budgetTier = 'average',
     ) {}
 
     public function handle(): void
@@ -44,8 +52,9 @@ class FetchCommanderAverageDeck implements ShouldQueue
         ]);
 
         try {
-            $url  = sprintf(self::AVG_DECK_URL, $this->commanderSlug);
-            $resp = $client->get($url);
+            $suffix = self::TIER_SUFFIXES[$this->budgetTier] ?? '';
+            $url    = sprintf(self::AVG_DECK_URL, $this->commanderSlug . $suffix);
+            $resp   = $client->get($url);
             $data = json_decode((string) $resp->getBody(), true);
         } catch (RequestException $e) {
             if ($e->getResponse() && in_array($e->getResponse()->getStatusCode(), [403, 404])) {
@@ -65,7 +74,7 @@ class FetchCommanderAverageDeck implements ShouldQueue
         }
 
         SampleDeck::updateOrCreate(
-            ['commander_slug' => $this->commanderSlug],
+            ['commander_slug' => $this->commanderSlug, 'budget_tier' => $this->budgetTier],
             [
                 'source'         => 'edhrec',
                 'format'         => 'commander',
@@ -76,8 +85,9 @@ class FetchCommanderAverageDeck implements ShouldQueue
         );
 
         Log::debug('FetchCommanderAverageDeck: saved', [
-            'commander' => $this->commanderName,
-            'cards'     => count($cards),
+            'commander'   => $this->commanderName,
+            'budget_tier' => $this->budgetTier,
+            'cards'       => count($cards),
         ]);
     }
 

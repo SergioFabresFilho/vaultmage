@@ -1,4 +1,5 @@
 import { useAuth } from '@/context/AuthContext';
+import { API_BASE_URL, API_CONNECTION_HELP } from '@/lib/api';
 import { useRouter } from 'expo-router';
 import { useState } from 'react';
 import {
@@ -11,8 +12,6 @@ import {
   TextInput,
   TouchableOpacity,
 } from 'react-native';
-
-const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:8000';
 
 export default function RegisterScreen() {
   const { signIn } = useAuth();
@@ -47,7 +46,7 @@ export default function RegisterScreen() {
       await signIn(data.token);
     } catch (e: any) {
       console.error('Register error:', e);
-      Alert.alert('Error', e?.message ?? 'Could not connect to server.');
+      Alert.alert('Error', e?.message ?? API_CONNECTION_HELP);
     } finally {
       setLoading(false);
     }

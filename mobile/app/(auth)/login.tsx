@@ -1,4 +1,5 @@
 import { useAuth } from '@/context/AuthContext';
+import { API_BASE_URL, API_CONNECTION_HELP } from '@/lib/api';
 import { useRouter } from 'expo-router';
 import { useState } from 'react';
 import {
@@ -12,8 +13,6 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-
-const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:8000';
 
 export default function LoginScreen() {
   const { signIn } = useAuth();
@@ -38,7 +37,7 @@ export default function LoginScreen() {
       }
       await signIn(data.token);
     } catch {
-      Alert.alert('Error', 'Could not connect to server.');
+      Alert.alert('Error', API_CONNECTION_HELP);
     } finally {
       setLoading(false);
     }
