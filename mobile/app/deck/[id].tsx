@@ -6,6 +6,8 @@ import {
   Dimensions,
   Image,
   Modal,
+  Platform,
+  ScrollView,
   SectionList,
   StyleSheet,
   Text,
@@ -367,52 +369,60 @@ export default function DeckViewScreen() {
                 <Text style={styles.modalTitle} numberOfLines={1}>
                   {selectedCard.name}
                 </Text>
-                <TouchableOpacity onPress={() => setSelectedCard(null)}>
-                  <Ionicons name="close" size={24} color="#f1e6dc" />
+                <TouchableOpacity style={styles.closeButton} onPress={() => setSelectedCard(null)}>
+                  <Ionicons name="close" size={24} color="#fff" />
                 </TouchableOpacity>
               </View>
 
-              {selectedCard.image_uri ? (
-                <Image
-                  source={{ uri: selectedCard.image_uri }}
-                  style={styles.cardImage}
-                  resizeMode="contain"
-                />
-              ) : (
-                <View style={styles.cardImagePlaceholder}>
-                  <Ionicons name="image-outline" size={48} color="#433647" />
-                </View>
-              )}
-
-              <View style={styles.cardDetails}>
-                <Text style={styles.cardDetailType}>{selectedCard.type_line}</Text>
-                <Text style={styles.cardDetailSet}>{selectedCard.set_name}</Text>
-                <View style={styles.cardDetailRow}>
-                  <View style={styles.qtyBadgeLarge}>
-                    <Text style={styles.qtyTextLarge}>×{selectedCard.pivot.quantity}</Text>
-                  </View>
-                  {!!selectedCard.pivot.is_sideboard && (
-                    <View style={styles.sideboardBadge}>
-                      <Text style={styles.sideboardText}>Sideboard</Text>
-                    </View>
-                  )}
-                </View>
-              </View>
-
-              <TouchableOpacity
-                style={[styles.removeButton, removing && styles.buttonDisabled]}
-                onPress={() => confirmRemove(selectedCard)}
-                disabled={removing}
-              >
-                {removing ? (
-                  <ActivityIndicator color="#fff" size="small" />
+              <ScrollView contentContainerStyle={styles.modalScroll}>
+                {selectedCard.image_uri ? (
+                  <Image
+                    source={{ uri: selectedCard.image_uri }}
+                    style={styles.cardImage}
+                    resizeMode="contain"
+                  />
                 ) : (
-                  <>
-                    <Ionicons name="trash-outline" size={18} color="#fff" style={{ marginRight: 8 }} />
-                    <Text style={styles.removeButtonText}>Remove from Deck</Text>
-                  </>
+                  <View style={[styles.cardImage, styles.cardImagePlaceholder]}>
+                    <Ionicons name="image-outline" size={48} color="#433647" />
+                  </View>
                 )}
-              </TouchableOpacity>
+
+                <View style={styles.modalInfo}>
+                  {selectedCard.mana_cost ? <ManaCost cost={selectedCard.mana_cost} size={20} /> : null}
+                  <Text style={styles.modalType}>{selectedCard.type_line}</Text>
+                  <Text style={styles.modalSet}>{selectedCard.set_name} • {selectedCard.rarity}</Text>
+                  {selectedCard.price_usd != null && (
+                    <Text style={styles.modalPrice}>${(selectedCard.price_usd * selectedCard.pivot.quantity).toFixed(2)}</Text>
+                  )}
+                  <View style={styles.cardDetailRow}>
+                    <View style={styles.qtyBadgeLarge}>
+                      <Text style={styles.qtyTextLarge}>×{selectedCard.pivot.quantity}</Text>
+                    </View>
+                    {!!selectedCard.pivot.is_sideboard && (
+                      <View style={styles.sideboardBadge}>
+                        <Text style={styles.sideboardText}>Sideboard</Text>
+                      </View>
+                    )}
+                  </View>
+                </View>
+              </ScrollView>
+
+              <View style={styles.modalActions}>
+                <TouchableOpacity
+                  style={[styles.removeButton, removing && styles.buttonDisabled]}
+                  onPress={() => confirmRemove(selectedCard)}
+                  disabled={removing}
+                >
+                  {removing ? (
+                    <ActivityIndicator color="#fff" size="small" />
+                  ) : (
+                    <>
+                      <Ionicons name="trash-outline" size={18} color="#fff" style={{ marginRight: 8 }} />
+                      <Text style={styles.removeButtonText}>Remove from Deck</Text>
+                    </>
+                  )}
+                </TouchableOpacity>
+              </View>
             </View>
           </View>
         )}
@@ -570,37 +580,57 @@ const styles = StyleSheet.create({
     backgroundColor: '#1a1a2e',
     borderTopLeftRadius: 24,
     borderTopRightRadius: 24,
-    padding: 24,
-    paddingBottom: 40,
-    maxHeight: '88%',
+    paddingTop: 16,
+    paddingBottom: Platform.OS === 'ios' ? 40 : 20,
+    height: '85%',
   },
   modalHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 16,
+    paddingHorizontal: 20,
+    paddingBottom: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#2a2a3e',
   },
-  modalTitle: { color: '#fff', fontSize: 18, fontWeight: '700', flex: 1, marginRight: 12 },
-  cardImage: {
-    width: SCREEN_WIDTH * 0.65,
-    height: (SCREEN_WIDTH * 0.65) / 0.716,
-    borderRadius: 12,
-    alignSelf: 'center',
-    marginBottom: 16,
-  },
-  cardImagePlaceholder: {
-    width: SCREEN_WIDTH * 0.65,
-    height: (SCREEN_WIDTH * 0.65) / 0.716,
-    borderRadius: 12,
-    alignSelf: 'center',
-    backgroundColor: '#0f0f1a',
+  modalTitle: { color: '#fff', fontSize: 18, fontWeight: '700', flex: 1, marginRight: 10 },
+  closeButton: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: 'rgba(255,255,255,0.1)',
     alignItems: 'center',
     justifyContent: 'center',
-    marginBottom: 16,
   },
-  cardDetails: { marginBottom: 20 },
-  cardDetailType: { color: '#ccc', fontSize: 14, marginBottom: 4 },
-  cardDetailSet: { color: '#888', fontSize: 13, marginBottom: 10 },
+  modalScroll: {
+    padding: 20,
+    alignItems: 'center',
+  },
+  cardImage: {
+    width: SCREEN_WIDTH * 0.7,
+    height: (SCREEN_WIDTH * 0.7) * 1.4,
+    borderRadius: 12,
+    marginBottom: 20,
+  },
+  cardImagePlaceholder: {
+    backgroundColor: '#2a2a3e',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modalInfo: {
+    alignItems: 'center',
+    marginBottom: 8,
+    gap: 6,
+  },
+  modalType: { color: '#aaa', fontSize: 15, textAlign: 'center' },
+  modalSet: { color: '#666', fontSize: 13, textAlign: 'center' },
+  modalPrice: { color: '#7dcea0', fontSize: 15, fontWeight: '600' },
+  modalActions: {
+    paddingHorizontal: 20,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: '#2a2a3e',
+  },
   cardDetailRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   qtyBadgeLarge: {
     backgroundColor: '#6C3CE1',
