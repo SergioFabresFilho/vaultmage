@@ -45,10 +45,20 @@ class DeckController extends Controller
             ->get()
             ->keyBy('deck_id');
 
-        return $decks->map(function ($deck) use ($totals) {
+        $commanderImages = \Illuminate\Support\Facades\DB::table('deck_cards')
+            ->join('cards', 'deck_cards.card_id', '=', 'cards.id')
+            ->whereIn('deck_cards.deck_id', $deckIds)
+            ->where('deck_cards.is_commander', true)
+            ->whereNotNull('cards.image_uri')
+            ->select('deck_cards.deck_id', 'cards.image_uri as commander_image_uri')
+            ->get()
+            ->keyBy('deck_id');
+
+        return $decks->map(function ($deck) use ($totals, $commanderImages) {
             $t = $totals->get($deck->id);
-            $deck->total_price   = $t ? round((float) $t->total_price, 2) : null;
-            $deck->missing_price = $t ? round((float) $t->missing_price, 2) : null;
+            $deck->total_price          = $t ? round((float) $t->total_price, 2) : null;
+            $deck->missing_price        = $t ? round((float) $t->missing_price, 2) : null;
+            $deck->commander_image_uri  = $commanderImages->get($deck->id)?->commander_image_uri ?? null;
             return $deck;
         });
     }

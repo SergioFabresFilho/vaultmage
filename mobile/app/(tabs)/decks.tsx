@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   Alert,
   FlatList,
+  Image,
   Modal,
   ScrollView,
   StyleSheet,
@@ -47,6 +48,7 @@ type Deck = {
   total_price: number | null;
   missing_price: number | null;
   is_draft: boolean;
+  commander_image_uri: string | null;
 };
 
 function formatLabel(value: string | null) {
@@ -196,7 +198,15 @@ export default function DecksScreen() {
             onPress={() => router.push(`/deck/${item.id}`)}
           >
             <View style={styles.deckIcon}>
-              <Ionicons name="layers" size={24} color="#ffb36b" />
+              {item.commander_image_uri ? (
+                <Image
+                  source={{ uri: item.commander_image_uri }}
+                  style={styles.deckIconImage}
+                  resizeMode="cover"
+                />
+              ) : (
+                <Ionicons name="layers" size={24} color="#ffb36b" />
+              )}
             </View>
             <View style={styles.deckInfo}>
               <View style={styles.deckNameRow}>
@@ -371,6 +381,12 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     marginRight: 16,
+    overflow: 'hidden',
+  },
+  deckIconImage: {
+    width: 48,
+    height: 48,
+    borderRadius: 10,
   },
   deckInfo: { flex: 1 },
   deckNameRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 4 },
