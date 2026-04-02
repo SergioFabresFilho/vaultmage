@@ -865,7 +865,13 @@ export default function AssistantScreen() {
   async function submitBuilderBrief() {
     const prompt = buildDeckPrompt();
     if (!prompt) {
-      Alert.alert('Budget needed', 'Enter a budget before starting the deck build.');
+      if (COMMANDER_FORMATS.has(builderFormat) && !selectedCommander) {
+        Alert.alert('Commander needed', 'Search for and select a commander before building.');
+      } else if (builderColors.length === 0) {
+        Alert.alert('Colors needed', 'Pick at least one color before building.');
+      } else {
+        Alert.alert('Budget needed', 'Enter a budget before starting the deck build.');
+      }
       return;
     }
 
@@ -1444,7 +1450,13 @@ export default function AssistantScreen() {
               <View style={styles.builderPreview}>
                 <Text style={styles.builderPreviewLabel}>Preview</Text>
                 <Text style={styles.builderPreviewText}>
-                  {buildDeckPrompt() ?? 'Choose a budget to generate the request.'}
+                  {buildDeckPrompt() ?? (
+                    COMMANDER_FORMATS.has(builderFormat) && !selectedCommander
+                      ? 'Choose a commander to generate the request.'
+                      : builderColors.length === 0
+                        ? 'Pick at least one color to generate the request.'
+                        : 'Choose a budget to generate the request.'
+                  )}
                 </Text>
               </View>
 
