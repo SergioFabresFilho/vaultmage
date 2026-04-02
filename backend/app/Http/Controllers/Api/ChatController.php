@@ -63,6 +63,16 @@ class ChatController extends Controller
         return response()->json($conversation);
     }
 
+    // DELETE /api/chat/conversations/{conversation}
+    public function destroyConversation(Request $request, Conversation $conversation): JsonResponse
+    {
+        $this->authorizeConversation($request, $conversation);
+
+        $conversation->delete();
+
+        return response()->json(['message' => 'Conversation deleted']);
+    }
+
     // POST /api/chat/conversations/{conversation}/messages
     public function sendMessage(Request $request, Conversation $conversation): JsonResponse
     {

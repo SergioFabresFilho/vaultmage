@@ -310,6 +310,7 @@ export default function AssistantScreen() {
   // Conversation list view
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [loadingList, setLoadingList] = useState(true);
+  const [deletingConversationId, setDeletingConversationId] = useState<number | null>(null);
 
   // Active chat view
   const [activeConversation, setActiveConversation] = useState<Conversation | null>(null);
@@ -395,6 +396,42 @@ export default function AssistantScreen() {
     } catch {
       Alert.alert('Error', 'Could not start a new conversation.');
     }
+  }
+
+  async function deleteConversation(conversationId: number) {
+    setDeletingConversationId(conversationId);
+
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/chat/conversations/${conversationId}`, {
+        method: 'DELETE',
+        headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
+      });
+
+      if (!res.ok) {
+        throw new Error('Failed to delete conversation');
+      }
+
+      setConversations((prev) => prev.filter((conversation) => conversation.id !== conversationId));
+      setActiveConversation((prev) => (prev?.id === conversationId ? null : prev));
+      setMessages((prev) => (activeConversation?.id === conversationId ? [] : prev));
+    } catch {
+      Alert.alert('Error', 'Could not delete conversation.');
+    } finally {
+      setDeletingConversationId(null);
+    }
+  }
+
+  function confirmDeleteConversation(conversation: Conversation) {
+    if (deletingConversationId != null) return;
+
+    Alert.alert('Delete Conversation', `Delete "${conversation.title ?? 'New conversation'}"?`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: () => deleteConversation(conversation.id),
+      },
+    ]);
   }
 
   useEffect(() => {
@@ -683,18 +720,30 @@ export default function AssistantScreen() {
             keyExtractor={(item) => item.id.toString()}
             contentContainerStyle={styles.listContent}
             renderItem={({ item }) => (
-              <TouchableOpacity style={styles.convItem} onPress={() => openConversation(item)}>
-                <View style={styles.convIcon}>
-                  <Ionicons name="chatbubble-ellipses" size={20} color="#6C3CE1" />
-                </View>
-                <View style={styles.convInfo}>
-                  <Text style={styles.convTitle} numberOfLines={1}>
-                    {item.title ?? 'New conversation'}
-                  </Text>
-                  <Text style={styles.convTime}>{timeAgo(item.updated_at)}</Text>
-                </View>
-                <Ionicons name="chevron-forward" size={20} color="#8a7d8f" />
-              </TouchableOpacity>
+              <View style={styles.convItem}>
+                <TouchableOpacity style={styles.convMain} onPress={() => openConversation(item)}>
+                  <View style={styles.convIcon}>
+                    <Ionicons name="chatbubble-ellipses" size={20} color="#6C3CE1" />
+                  </View>
+                  <View style={styles.convInfo}>
+                    <Text style={styles.convTitle} numberOfLines={1}>
+                      {item.title ?? 'New conversation'}
+                    </Text>
+                    <Text style={styles.convTime}>{timeAgo(item.updated_at)}</Text>
+                  </View>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.convDeleteBtn}
+                  onPress={() => confirmDeleteConversation(item)}
+                  disabled={deletingConversationId === item.id}
+                >
+                  {deletingConversationId === item.id ? (
+                    <ActivityIndicator color="#ff9b9b" size="small" />
+                  ) : (
+                    <Ionicons name="trash-outline" size={18} color="#ff8c8c" />
+                  )}
+                </TouchableOpacity>
+              </View>
             )}
           />
         )}
@@ -722,6 +771,17 @@ export default function AssistantScreen() {
         <Text style={styles.chatHeaderTitle} numberOfLines={1}>
           {activeConversation.title ?? 'New conversation'}
         </Text>
+        <TouchableOpacity
+          style={styles.chatHeaderIconBtn}
+          onPress={() => confirmDeleteConversation(activeConversation)}
+          disabled={deletingConversationId === activeConversation.id}
+        >
+          {deletingConversationId === activeConversation.id ? (
+            <ActivityIndicator color="#ff9b9b" size="small" />
+          ) : (
+            <Ionicons name="trash-outline" size={20} color="#ff8c8c" />
+          )}
+        </TouchableOpacity>
         <TouchableOpacity style={styles.newChatIconBtn} onPress={() => startNewConversation()}>
           <Ionicons name="add-circle-outline" size={24} color="#6C3CE1" />
         </TouchableOpacity>
@@ -927,6 +987,11 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#2a2a3e',
   },
+  convMain: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
   convIcon: {
     width: 40,
     height: 40,
@@ -939,6 +1004,13 @@ const styles = StyleSheet.create({
   convInfo: { flex: 1 },
   convTitle: { color: '#fff', fontSize: 15, fontWeight: '600', marginBottom: 3 },
   convTime: { color: '#666', fontSize: 12 },
+  convDeleteBtn: {
+    width: 36,
+    height: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginLeft: 10,
+  },
 
   // Empty states
   emptyState: {
@@ -970,6 +1042,7 @@ const styles = StyleSheet.create({
   },
   backBtn: { padding: 6, marginRight: 4 },
   chatHeaderTitle: { flex: 1, color: '#fff', fontSize: 16, fontWeight: '600' },
+  chatHeaderIconBtn: { padding: 6 },
   newChatIconBtn: { padding: 6 },
   activeDeckBanner: {
     flexDirection: 'row',

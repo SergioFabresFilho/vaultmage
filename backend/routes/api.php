@@ -23,6 +23,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/chat/conversations', [ChatController::class, 'indexConversations']);
     Route::post('/chat/conversations', [ChatController::class, 'storeConversation']);
     Route::get('/chat/conversations/{conversation}', [ChatController::class, 'showConversation']);
+    Route::delete('/chat/conversations/{conversation}', [ChatController::class, 'destroyConversation']);
     Route::post('/chat/conversations/{conversation}/messages', [ChatController::class, 'sendMessage']);
     Route::post('/chat/conversations/{conversation}/messages/stream', [ChatController::class, 'streamMessage']);
     Route::post('/chat/conversations/{conversation}/create-deck', [ChatController::class, 'createDeck']);

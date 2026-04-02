@@ -66,6 +66,34 @@ class AiDeckBuilderTest extends TestCase
         ]);
     }
 
+    public function test_user_can_delete_their_own_conversation(): void
+    {
+        $response = $this->actingAs($this->user)
+            ->deleteJson("/api/chat/conversations/{$this->conversation->id}");
+
+        $response->assertOk()
+            ->assertJsonPath('message', 'Conversation deleted');
+
+        $this->assertDatabaseMissing('conversations', [
+            'id' => $this->conversation->id,
+        ]);
+    }
+
+    public function test_user_cannot_delete_another_users_conversation(): void
+    {
+        $other = User::factory()->create();
+        $otherConv = Conversation::create(['user_id' => $other->id, 'title' => null]);
+
+        $response = $this->actingAs($this->user)
+            ->deleteJson("/api/chat/conversations/{$otherConv->id}");
+
+        $response->assertStatus(403);
+
+        $this->assertDatabaseHas('conversations', [
+            'id' => $otherConv->id,
+        ]);
+    }
+
     // -------------------------------------------------------------------------
     // Missing info
     // -------------------------------------------------------------------------
