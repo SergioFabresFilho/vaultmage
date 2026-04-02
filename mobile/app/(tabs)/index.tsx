@@ -113,10 +113,43 @@ function cardTypeGroup(typeLine: string): string {
   return 'Other';
 }
 
-function buildListData(cards: CollectionCard[], collapsed: Set<string>): ListItem[] {
-  const groups: Record<string, CollectionCard[]> = {};
+function mergeCardsByName(cards: CollectionCard[]): CollectionCard[] {
+  const map = new Map<string, { card: CollectionCard; totalQty: number; totalValue: number; hasPrice: boolean }>();
 
   for (const card of cards) {
+    const qty = card.pivot.quantity;
+    const existing = map.get(card.name);
+
+    if (!existing) {
+      map.set(card.name, {
+        card: { ...card, pivot: { ...card.pivot } },
+        totalQty: qty,
+        totalValue: card.price_usd != null ? card.price_usd * qty : 0,
+        hasPrice: card.price_usd != null,
+      });
+    } else {
+      existing.totalQty += qty;
+      existing.totalValue += card.price_usd != null ? card.price_usd * qty : 0;
+      existing.hasPrice = existing.hasPrice || card.price_usd != null;
+      // Prefer a printing that has an image
+      if (!existing.card.image_uri && card.image_uri) {
+        existing.card = { ...card, pivot: existing.card.pivot };
+      }
+    }
+  }
+
+  return Array.from(map.values()).map(({ card, totalQty, totalValue, hasPrice }) => ({
+    ...card,
+    pivot: { ...card.pivot, quantity: totalQty },
+    price_usd: hasPrice ? totalValue : null,
+  }));
+}
+
+function buildListData(cards: CollectionCard[], collapsed: Set<string>): ListItem[] {
+  const merged = mergeCardsByName(cards);
+  const groups: Record<string, CollectionCard[]> = {};
+
+  for (const card of merged) {
     const group = cardTypeGroup(card.type_line);
     if (!groups[group]) groups[group] = [];
     groups[group].push(card);
@@ -672,13 +705,18 @@ export default function CollectionScreen() {
                     <Text style={styles.modalSet}>
                       {selectedCard.set_name} • {selectedCard.rarity}
                     </Text>
+                    {selectedCard.price_usd != null && (
+                      <Text style={styles.modalPrice}>${selectedCard.price_usd.toFixed(2)}</Text>
+                    )}
                     {isCollectionCard(selectedCard) && selectedCard.pivot.foil ? (
                       <View style={styles.foilBadgeModal}>
                         <Text style={styles.foilBadgeText}>Foil</Text>
                       </View>
                     ) : null}
                   </View>
+                </ScrollView>
 
+                <View style={styles.modalActions}>
                   {isCollectionCard(selectedCard) ? (
                     <>
                       <View style={styles.quantitySection}>
@@ -741,7 +779,7 @@ export default function CollectionScreen() {
                       </TouchableOpacity>
                     </View>
                   )}
-                </ScrollView>
+                </View>
               </>
             ) : null}
 
@@ -1213,7 +1251,13 @@ const styles = StyleSheet.create({
   },
   modalInfo: {
     alignItems: 'center',
-    marginBottom: 24,
+    marginBottom: 8,
+  },
+  modalActions: {
+    paddingHorizontal: 20,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: '#2a2a3e',
   },
   modalMana: {
     marginBottom: 8,
@@ -1223,6 +1267,12 @@ const styles = StyleSheet.create({
     fontSize: 15,
     textAlign: 'center',
     marginBottom: 6,
+  },
+  modalPrice: {
+    color: '#7dcea0',
+    fontSize: 15,
+    fontWeight: '600',
+    marginTop: 6,
   },
   modalSet: {
     color: '#666',
@@ -1244,7 +1294,7 @@ const styles = StyleSheet.create({
   },
   quantitySection: {
     alignItems: 'center',
-    marginBottom: 20,
+    marginBottom: 16,
     width: '100%',
   },
   quantityLabel: {
