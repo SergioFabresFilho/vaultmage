@@ -41,6 +41,15 @@ php artisan boost:install
 
 Boost provides your agent 15+ tools and skills that help agents build Laravel applications while following best practices.
 
+## API Docs
+
+Swagger-style API documentation is available through Scramble.
+
+- UI: `/docs/api`
+- OpenAPI JSON: `/docs/api.json`
+
+By default, the docs are available in the `local` environment. This project also allows access in `testing` so the docs endpoints can be covered by automated tests.
+
 ## Contributing
 
 Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
