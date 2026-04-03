@@ -98,7 +98,7 @@ class CardOcrParser
         }
 
         // "174/361 C CMR PT ..." — rarity letter separates collector from set code (same line)
-        if (preg_match('/(\d{1,3})\/(\d{2,4})[ \t]+[CURMTS][ \t]+([A-Z][A-Z0-9]{1,3})\b/iu', $text, $m)) {
+        if (preg_match('/(\d{1,3})\/(\d{2,4})[ \t]+[CURMLTSB][ \t]+([A-Z][A-Z0-9]{1,3})\b/iu', $text, $m)) {
             $setCode = $this->normalizeSetCodeCandidate($m[3]);
             if ($setCode !== null) {
                 return ['set_code' => $setCode, 'collector_number' => $m[1]];
@@ -140,7 +140,7 @@ class CardOcrParser
                 }
 
                 // "301\nC\nMID EN ..." — standalone collector number, rarity on next line, set code after that
-                if (preg_match('/^[CURMTS]$/', $next) && ($setCode = $this->extractSetCodeFromLine($afterNext)) !== null) {
+                if (preg_match('/^[CURMLTSB]$/', $next) && ($setCode = $this->extractSetCodeFromLine($afterNext)) !== null) {
                     $score = $this->lineHasLanguageMarker($afterNext) ? 4 : 3;
                     $this->recordCollectorCandidate($bestCandidate, $bestScore, $setCode, $collectorNumber, $score);
                 }

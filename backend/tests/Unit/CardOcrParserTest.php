@@ -256,6 +256,22 @@ TEXT;
         $this->assertEquals('190', $result['collector_number']);
     }
 
+    public function test_it_parses_basic_land_with_inline_land_rarity_letter()
+    {
+        $ocrText = <<<TEXT
+Plains
+Basic Land Plains
+295/290 L ZNR EN
+TM & © 2020 Wizards of the Coast
+TEXT;
+
+        $result = $this->parser->parse($ocrText);
+
+        $this->assertEquals('Plains', $result['name']);
+        $this->assertEquals('ZNR', $result['set_code']);
+        $this->assertEquals('295', $result['collector_number']);
+    }
+
     public function test_it_extracts_basic_land_name_when_first_line_is_noise()
     {
         $ocrText = <<<TEXT
