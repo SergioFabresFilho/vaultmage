@@ -59,6 +59,10 @@ By default, the docs are available in the `local` environment. This project also
 - chunk workers: dispatched onto the `cards` queue
 - run tracking: `card_import_runs` table
 
+## Google Vision Credentials
+
+For cloud deployments, prefer `GOOGLE_VISION_CREDENTIALS_BASE64` over raw JSON in `.env`. Base64 avoids dotenv parsing issues with quotes, whitespace, and multiline private keys.
+
 ## Contributing
 
 Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).

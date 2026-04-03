@@ -37,6 +37,7 @@ return [
 
     'google_vision' => [
         'credentials' => env('GOOGLE_VISION_CREDENTIALS'),
+        'credentials_base64' => env('GOOGLE_VISION_CREDENTIALS_BASE64'),
         'project_id' => env('GOOGLE_CLOUD_PROJECT_ID'),
     ],
 

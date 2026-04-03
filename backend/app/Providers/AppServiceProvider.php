@@ -23,6 +23,24 @@ class AppServiceProvider extends ServiceProvider
             $options = [];
 
             $credentials = config('services.google_vision.credentials');
+            $credentialsBase64 = config('services.google_vision.credentials_base64');
+
+            if ($credentialsBase64) {
+                $decoded = base64_decode($credentialsBase64, true);
+
+                if ($decoded === false) {
+                    throw new \InvalidArgumentException('GOOGLE_VISION_CREDENTIALS_BASE64 is not valid base64.');
+                }
+
+                $decodedJson = json_decode($decoded, true);
+
+                if (! is_array($decodedJson)) {
+                    throw new \InvalidArgumentException('GOOGLE_VISION_CREDENTIALS_BASE64 does not decode to valid JSON credentials.');
+                }
+
+                $options['credentials'] = $decodedJson;
+            }
+
             if ($credentials) {
                 // Accept either a file path or an inline JSON string
                 $options['credentials'] = file_exists($credentials)
