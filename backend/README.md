@@ -50,6 +50,15 @@ Swagger-style API documentation is available through Scramble.
 
 By default, the docs are available in the `local` environment. This project also allows access in `testing` so the docs endpoints can be covered by automated tests.
 
+## Card Import
+
+`php artisan cards:import-bulk` now queues the Scryfall catalog import instead of running it inline. This is intended for environments like Laravel Cloud where long-running foreground commands can time out.
+
+- queue trigger: `php artisan cards:import-bulk`
+- status command: `php artisan cards:import-status`
+- chunk workers: dispatched onto the `cards` queue
+- run tracking: `card_import_runs` table
+
 ## Contributing
 
 Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
