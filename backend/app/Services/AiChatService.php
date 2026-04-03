@@ -952,17 +952,23 @@ class AiChatService
             $query->where("legalities->{$format}", 'legal');
         }
 
-        $cards = $query->get()->map(fn ($card) => [
-            'id'             => $card->id,
-            'name'           => $card->name,
-            'type_line'      => $card->type_line,
-            'mana_cost'      => $card->mana_cost,
-            'cmc'            => $card->cmc,
-            'color_identity' => $card->color_identity,
-            'oracle_text'    => $card->oracle_text ? mb_substr($card->oracle_text, 0, 120) : null,
-            'price_usd'      => $card->price_usd,
-            'quantity_owned' => $card->pivot->quantity,
-        ]);
+        $cards = $query->get()
+            ->groupBy('name')
+            ->map(function ($versions) {
+                $first = $versions->first();
+
+                return [
+                    'id'             => $first->id,
+                    'name'           => $first->name,
+                    'type_line'      => $first->type_line,
+                    'mana_cost'      => $first->mana_cost,
+                    'cmc'            => $first->cmc,
+                    'color_identity' => $first->color_identity,
+                    'oracle_text'    => $first->oracle_text ? mb_substr($first->oracle_text, 0, 120) : null,
+                    'price_usd'      => $first->price_usd,
+                    'quantity_owned' => $versions->sum(fn ($c) => $c->pivot->quantity),
+                ];
+            });
 
         return ['cards' => $cards->values()->all(), 'total' => $cards->count()];
     }
