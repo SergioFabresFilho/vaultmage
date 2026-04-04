@@ -47,6 +47,8 @@ type Deck = {
   cards_sum_quantity: number;
   total_price: number | null;
   missing_price: number | null;
+  owned_cards_count: number;
+  missing_cards_count: number;
   is_draft: boolean;
   commander_image_uri: string | null;
 };
@@ -71,6 +73,30 @@ function ColorPips({ colors }: { colors: string[] | null }) {
       })}
     </View>
   );
+}
+
+function ownershipLabel(deck: Deck) {
+  if (deck.missing_cards_count <= 0) {
+    return 'Complete';
+  }
+
+  if (deck.owned_cards_count <= 0) {
+    return `Missing ${deck.missing_cards_count} cards`;
+  }
+
+  return `${deck.missing_cards_count} cards missing`;
+}
+
+function ownershipStyle(deck: Deck) {
+  if (deck.missing_cards_count <= 0) {
+    return styles.ownershipBadgeComplete;
+  }
+
+  if (deck.owned_cards_count <= 0) {
+    return styles.ownershipBadgeMissing;
+  }
+
+  return styles.ownershipBadgePartial;
 }
 
 export default function DecksScreen() {
@@ -222,6 +248,9 @@ export default function DecksScreen() {
                   {formatLabel(item.format)} • {item.cards_sum_quantity} cards
                 </Text>
                 <ColorPips colors={item.color_identity} />
+              </View>
+              <View style={[styles.ownershipBadge, ownershipStyle(item)]}>
+                <Text style={styles.ownershipBadgeText}>{ownershipLabel(item)}</Text>
               </View>
               {item.total_price != null && (
                 <View style={styles.deckPriceRow}>
@@ -395,6 +424,29 @@ const styles = StyleSheet.create({
   draftBadgeText: { color: '#fbbf24', fontSize: 10, fontWeight: '700', letterSpacing: 0.5 },
   deckMetaRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   deckMeta: { color: '#888', fontSize: 13 },
+  ownershipBadge: {
+    alignSelf: 'flex-start',
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    marginTop: 8,
+  },
+  ownershipBadgeComplete: {
+    backgroundColor: 'rgba(125, 206, 160, 0.16)',
+    borderWidth: 1,
+    borderColor: 'rgba(125, 206, 160, 0.35)',
+  },
+  ownershipBadgePartial: {
+    backgroundColor: 'rgba(255, 179, 107, 0.16)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 179, 107, 0.35)',
+  },
+  ownershipBadgeMissing: {
+    backgroundColor: 'rgba(255, 140, 140, 0.16)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 140, 140, 0.35)',
+  },
+  ownershipBadgeText: { color: '#f3eee8', fontSize: 11, fontWeight: '700' },
   deckPriceRow: { flexDirection: 'row', alignItems: 'center', marginTop: 3 },
   deckPriceTotal: { color: '#7dcea0', fontSize: 12, fontWeight: '600' },
   deckPriceMissing: { color: '#e8975a', fontSize: 12 },

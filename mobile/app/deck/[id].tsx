@@ -1,6 +1,10 @@
 import { API_BASE_URL } from '@/lib/api';
-import { useCallback, useEffect, useState } from 'react';
+import * as Clipboard from 'expo-clipboard';
+import * as FileSystem from 'expo-file-system/legacy';
+import * as Sharing from 'expo-sharing';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  Animated,
   ActivityIndicator,
   Alert,
   Dimensions,
@@ -9,6 +13,7 @@ import {
   Platform,
   ScrollView,
   SectionList,
+  Share,
   StyleSheet,
   Text,
   TouchableOpacity,
@@ -53,6 +58,9 @@ type Card = {
   set_name: string;
   rarity: string;
   price_usd: number | null;
+  quantity_required: number;
+  owned_quantity: number;
+  missing_quantity: number;
   pivot: {
     quantity: number;
     is_sideboard: boolean;
@@ -67,6 +75,34 @@ type Deck = {
   description: string | null;
   color_identity: string[] | null;
   cards: Card[];
+};
+
+type BuyListItem = {
+  card_id: number;
+  name: string;
+  set_name: string;
+  type_line: string;
+  mana_cost: string | null;
+  image_uri: string | null;
+  rarity: string;
+  quantity_required: number;
+  owned_quantity: number;
+  missing_quantity: number;
+  price_usd: number | null;
+  line_total: number | null;
+  is_commander: boolean;
+  is_sideboard: boolean;
+};
+
+type BuyList = {
+  deck_id: number;
+  deck_name: string;
+  format: string | null;
+  items: BuyListItem[];
+  missing_cards_count: number;
+  estimated_total: number;
+  priced_items_count: number;
+  unpriced_items_count: number;
 };
 
 type Section = {
@@ -143,6 +179,113 @@ function buildSections(cards: Card[], format?: string | null): Section[] {
   return sections;
 }
 
+function ownershipLabel(card: Card): string {
+  if (card.missing_quantity <= 0) {
+    return 'Complete';
+  }
+
+  if (card.owned_quantity <= 0) {
+    return `Missing ${card.missing_quantity}`;
+  }
+
+  return `Own ${card.owned_quantity} / Need ${card.quantity_required}`;
+}
+
+function ownershipStyle(card: Card) {
+  if (card.missing_quantity <= 0) {
+    return styles.ownershipBadgeComplete;
+  }
+
+  if (card.owned_quantity <= 0) {
+    return styles.ownershipBadgeMissing;
+  }
+
+  return styles.ownershipBadgePartial;
+}
+
+function buildBuyListExportText(buyList: BuyList): string {
+  const lines = [
+    `${buyList.deck_name} Buy List`,
+    buyList.format ? `Format: ${buyList.format}` : null,
+    `Missing cards: ${buyList.missing_cards_count}`,
+    `Estimated total: $${buyList.estimated_total.toFixed(2)}`,
+    buyList.unpriced_items_count > 0
+      ? `Unpriced items: ${buyList.unpriced_items_count}`
+      : null,
+    '',
+    ...buyList.items.map((item) => {
+      const priceText = item.line_total != null
+        ? ` - $${item.line_total.toFixed(2)} total`
+        : ' - no price';
+
+      return `${item.missing_quantity}x ${item.name}${priceText}`;
+    }),
+  ];
+
+  return lines.filter(Boolean).join('\n');
+}
+
+function buyListItemCategory(item: BuyListItem): string {
+  if (item.is_commander) return 'commander';
+  if (item.is_sideboard) return 'sideboard';
+  return 'mainboard';
+}
+
+function buyListItemPriority(item: BuyListItem): string {
+  if (item.is_commander) return 'must-buy';
+  if (item.is_sideboard) return 'optional';
+  return 'must-buy';
+}
+
+function csvEscape(value: string | number | boolean | null): string {
+  if (value === null) {
+    return '';
+  }
+
+  const text = String(value);
+  if (!text.includes(',') && !text.includes('"') && !text.includes('\n')) {
+    return text;
+  }
+
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+function buildBuyListCsv(buyList: BuyList): string {
+  const header = [
+    'name',
+    'set_name',
+    'type_line',
+    'missing_quantity',
+    'owned_quantity',
+    'quantity_required',
+    'priority',
+    'category',
+    'price_usd',
+    'line_total',
+    'is_commander',
+    'is_sideboard',
+  ];
+
+  const rows = buyList.items.map((item) => [
+    item.name,
+    item.set_name,
+    item.type_line,
+    item.missing_quantity,
+    item.owned_quantity,
+    item.quantity_required,
+    buyListItemPriority(item),
+    buyListItemCategory(item),
+    item.price_usd,
+    item.line_total,
+    item.is_commander,
+    item.is_sideboard,
+  ]);
+
+  return [header, ...rows]
+    .map((row) => row.map((value) => csvEscape(value)).join(','))
+    .join('\n');
+}
+
 export default function DeckViewScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const { token } = useAuth();
@@ -153,6 +296,11 @@ export default function DeckViewScreen() {
   const [selectedCard, setSelectedCard] = useState<Card | null>(null);
   const [removing, setRemoving] = useState(false);
   const [deletingDeck, setDeletingDeck] = useState(false);
+  const [buyList, setBuyList] = useState<BuyList | null>(null);
+  const [buyListVisible, setBuyListVisible] = useState(false);
+  const [buyListLoading, setBuyListLoading] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const toastOpacity = useRef(new Animated.Value(0)).current;
 
   const fetchDeck = useCallback(async () => {
     try {
@@ -169,6 +317,18 @@ export default function DeckViewScreen() {
   useEffect(() => {
     fetchDeck().finally(() => setLoading(false));
   }, [fetchDeck]);
+
+  function showToast(message: string) {
+    setToastMessage(message);
+    toastOpacity.stopAnimation();
+    toastOpacity.setValue(0);
+
+    Animated.sequence([
+      Animated.timing(toastOpacity, { toValue: 1, duration: 180, useNativeDriver: true }),
+      Animated.delay(1800),
+      Animated.timing(toastOpacity, { toValue: 0, duration: 240, useNativeDriver: true }),
+    ]).start(() => setToastMessage(null));
+  }
 
   async function handleRemoveCard(card: Card) {
     setRemoving(true);
@@ -213,6 +373,78 @@ export default function DeckViewScreen() {
       Alert.alert('Error', 'Failed to delete deck.');
     } finally {
       setDeletingDeck(false);
+    }
+  }
+
+  async function openBuyList() {
+    setBuyListLoading(true);
+
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/decks/${id}/buy-list`, {
+        headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
+      });
+
+      if (!res.ok) {
+        throw new Error('Failed to load buy list');
+      }
+
+      const data: BuyList = await res.json();
+      setBuyList(data);
+      setBuyListVisible(true);
+    } catch {
+      Alert.alert('Error', 'Failed to load the buy list for this deck.');
+    } finally {
+      setBuyListLoading(false);
+    }
+  }
+
+  async function handleShareBuyList() {
+    if (!buyList) return;
+
+    try {
+      await Share.share({
+        title: `${buyList.deck_name} Buy List`,
+        message: buildBuyListExportText(buyList),
+      });
+      showToast('Share sheet opened.');
+    } catch {
+      Alert.alert('Error', 'Failed to share the buy list.');
+    }
+  }
+
+  async function handleCopyBuyList() {
+    if (!buyList) return;
+
+    try {
+      await Clipboard.setStringAsync(buildBuyListExportText(buyList));
+      showToast('Buy list copied to clipboard.');
+    } catch {
+      Alert.alert('Error', 'Failed to copy the buy list.');
+    }
+  }
+
+  async function handleExportBuyListCsv() {
+    if (!buyList) return;
+
+    try {
+      const fileUri = `${FileSystem.cacheDirectory ?? FileSystem.documentDirectory}buy-list-${buyList.deck_id}.csv`;
+      await FileSystem.writeAsStringAsync(fileUri, buildBuyListCsv(buyList), {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+
+      const canShare = await Sharing.isAvailableAsync();
+      if (!canShare) {
+        throw new Error('Sharing unavailable');
+      }
+
+      await Sharing.shareAsync(fileUri, {
+        mimeType: 'text/csv',
+        dialogTitle: `${buyList.deck_name} Buy List CSV`,
+        UTI: 'public.comma-separated-values-text',
+      });
+      showToast('CSV export ready to share.');
+    } catch {
+      Alert.alert('Error', 'Failed to export the buy list CSV.');
     }
   }
 
@@ -302,6 +534,21 @@ export default function DeckViewScreen() {
         <Text style={styles.assistantBtnText}>Ask AI to improve this deck</Text>
       </TouchableOpacity>
 
+      <TouchableOpacity
+        style={[styles.buyListBtn, buyListLoading && styles.buttonDisabled]}
+        onPress={openBuyList}
+        disabled={buyListLoading}
+      >
+        {buyListLoading ? (
+          <ActivityIndicator color="#fff" size="small" />
+        ) : (
+          <>
+            <Ionicons name="cart" size={18} color="#fff" />
+            <Text style={styles.buyListBtnText}>Buy Missing Cards</Text>
+          </>
+        )}
+      </TouchableOpacity>
+
       {sections.length === 0 ? (
         <View style={styles.emptyState}>
           <Ionicons name="layers-outline" size={64} color="#433647" />
@@ -339,6 +586,9 @@ export default function DeckViewScreen() {
                 <Text style={styles.cardType} numberOfLines={1}>
                   {item.type_line}
                 </Text>
+                <View style={[styles.ownershipBadge, ownershipStyle(item)]}>
+                  <Text style={styles.ownershipBadgeText}>{ownershipLabel(item)}</Text>
+                </View>
               </View>
               <View style={{ alignItems: 'flex-end' }}>
                 {item.mana_cost ? (
@@ -394,6 +644,9 @@ export default function DeckViewScreen() {
                   {selectedCard.price_usd != null && (
                     <Text style={styles.modalPrice}>${(selectedCard.price_usd * selectedCard.pivot.quantity).toFixed(2)}</Text>
                   )}
+                  <View style={[styles.ownershipBadge, styles.modalOwnershipBadge, ownershipStyle(selectedCard)]}>
+                    <Text style={styles.ownershipBadgeText}>{ownershipLabel(selectedCard)}</Text>
+                  </View>
                   <View style={styles.cardDetailRow}>
                     <View style={styles.qtyBadgeLarge}>
                       <Text style={styles.qtyTextLarge}>×{selectedCard.pivot.quantity}</Text>
@@ -404,6 +657,9 @@ export default function DeckViewScreen() {
                       </View>
                     )}
                   </View>
+                  <Text style={styles.ownershipDetailText}>
+                    You own {selectedCard.owned_quantity} of {selectedCard.quantity_required} required copy{selectedCard.quantity_required === 1 ? '' : 'ies'}.
+                  </Text>
                 </View>
               </ScrollView>
 
@@ -427,6 +683,96 @@ export default function DeckViewScreen() {
           </View>
         )}
       </Modal>
+
+      <Modal
+        animationType="slide"
+        transparent
+        visible={buyListVisible}
+        onRequestClose={() => setBuyListVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Buy Missing Cards</Text>
+              <TouchableOpacity style={styles.closeButton} onPress={() => setBuyListVisible(false)}>
+                <Ionicons name="close" size={24} color="#fff" />
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView contentContainerStyle={styles.buyListScroll}>
+              <View style={styles.buyListSummaryCard}>
+                <Text style={styles.buyListSummaryTitle}>{deck.name}</Text>
+                <Text style={styles.buyListSummaryMeta}>
+                  {buyList?.missing_cards_count ?? 0} missing card{(buyList?.missing_cards_count ?? 0) === 1 ? '' : 's'}
+                </Text>
+                <Text style={styles.buyListSummaryTotal}>Estimated total: ${(buyList?.estimated_total ?? 0).toFixed(2)}</Text>
+                {(buyList?.unpriced_items_count ?? 0) > 0 ? (
+                  <Text style={styles.buyListSummaryHint}>
+                    {buyList?.unpriced_items_count} item{buyList?.unpriced_items_count === 1 ? '' : 's'} missing price data.
+                  </Text>
+                ) : null}
+                {buyList ? (
+                  <View style={styles.buyListExportRow}>
+                    <TouchableOpacity style={styles.buyListExportBtn} onPress={handleCopyBuyList}>
+                      <Ionicons name="copy-outline" size={16} color="#fff" />
+                      <Text style={styles.buyListExportBtnText}>Copy as Text</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.buyListExportBtn} onPress={handleExportBuyListCsv}>
+                      <Ionicons name="document-text-outline" size={16} color="#fff" />
+                      <Text style={styles.buyListExportBtnText}>Export CSV</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.buyListExportBtn} onPress={handleShareBuyList}>
+                      <Ionicons name="share-social-outline" size={16} color="#fff" />
+                      <Text style={styles.buyListExportBtnText}>Share Text</Text>
+                    </TouchableOpacity>
+                  </View>
+                ) : null}
+              </View>
+
+              {buyList?.items.length ? (
+                buyList.items.map((item) => (
+                  <View key={`${item.card_id}-${item.name}`} style={styles.buyListItem}>
+                    {item.image_uri ? (
+                      <Image source={{ uri: item.image_uri }} style={styles.buyListThumb} resizeMode="cover" />
+                    ) : (
+                      <View style={[styles.buyListThumb, styles.cardThumbPlaceholder]}>
+                        <Ionicons name="image-outline" size={18} color="#433647" />
+                      </View>
+                    )}
+                    <View style={styles.buyListInfo}>
+                      <Text style={styles.buyListName}>{item.name}</Text>
+                      <Text style={styles.buyListMeta}>
+                        Need {item.missing_quantity} · Own {item.owned_quantity} / {item.quantity_required}
+                      </Text>
+                      <Text style={styles.buyListType} numberOfLines={1}>{item.type_line}</Text>
+                    </View>
+                    <View style={styles.buyListPriceCol}>
+                      <Text style={styles.buyListLineTotal}>
+                        {item.line_total != null ? `$${item.line_total.toFixed(2)}` : 'No price'}
+                      </Text>
+                      {item.price_usd != null ? (
+                        <Text style={styles.buyListUnitPrice}>${item.price_usd.toFixed(2)} each</Text>
+                      ) : null}
+                    </View>
+                  </View>
+                ))
+              ) : (
+                <View style={styles.buyListEmptyState}>
+                  <Ionicons name="checkmark-circle-outline" size={52} color="#7dcea0" />
+                  <Text style={styles.buyListEmptyTitle}>No cards left to buy</Text>
+                  <Text style={styles.buyListEmptyText}>This deck is fully covered by your collection.</Text>
+                </View>
+              )}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
+      {toastMessage ? (
+        <Animated.View style={[styles.toast, { opacity: toastOpacity }]} pointerEvents="none">
+          <Text style={styles.toastText}>{toastMessage}</Text>
+        </Animated.View>
+      ) : null}
     </View>
   );
 }
@@ -490,6 +836,24 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   assistantBtnText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  buyListBtn: {
+    marginHorizontal: 16,
+    marginTop: 8,
+    marginBottom: 4,
+    backgroundColor: '#1f6f56',
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  buyListBtnText: {
     color: '#fff',
     fontSize: 14,
     fontWeight: '700',
@@ -565,6 +929,29 @@ const styles = StyleSheet.create({
   cardInfo: { flex: 1 },
   cardName: { color: '#fff', fontSize: 15, fontWeight: '600' },
   cardType: { color: '#888', fontSize: 12, marginTop: 2 },
+  ownershipBadge: {
+    alignSelf: 'flex-start',
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    marginTop: 6,
+  },
+  ownershipBadgeComplete: {
+    backgroundColor: 'rgba(125, 206, 160, 0.16)',
+    borderWidth: 1,
+    borderColor: 'rgba(125, 206, 160, 0.35)',
+  },
+  ownershipBadgePartial: {
+    backgroundColor: 'rgba(255, 179, 107, 0.16)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 179, 107, 0.35)',
+  },
+  ownershipBadgeMissing: {
+    backgroundColor: 'rgba(255, 140, 140, 0.16)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 140, 140, 0.35)',
+  },
+  ownershipBadgeText: { color: '#f3eee8', fontSize: 11, fontWeight: '700' },
   cardPrice: { color: '#7dcea0', fontSize: 12, marginLeft: 6 },
   rowChevron: { marginLeft: 4 },
   emptyState: {
@@ -606,6 +993,9 @@ const styles = StyleSheet.create({
     padding: 20,
     alignItems: 'center',
   },
+  buyListScroll: {
+    padding: 20,
+  },
   cardImage: {
     width: SCREEN_WIDTH * 0.7,
     height: (SCREEN_WIDTH * 0.7) * 1.4,
@@ -625,6 +1015,69 @@ const styles = StyleSheet.create({
   modalType: { color: '#aaa', fontSize: 15, textAlign: 'center' },
   modalSet: { color: '#666', fontSize: 13, textAlign: 'center' },
   modalPrice: { color: '#7dcea0', fontSize: 15, fontWeight: '600' },
+  modalOwnershipBadge: {
+    alignSelf: 'center',
+    marginTop: 2,
+  },
+  buyListSummaryCard: {
+    backgroundColor: '#0f0f1a',
+    borderRadius: 16,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: '#2a2a3e',
+    marginBottom: 16,
+  },
+  buyListSummaryTitle: { color: '#fff', fontSize: 18, fontWeight: '700' },
+  buyListSummaryMeta: { color: '#aaa', fontSize: 13, marginTop: 4 },
+  buyListSummaryTotal: { color: '#7dcea0', fontSize: 15, fontWeight: '700', marginTop: 8 },
+  buyListSummaryHint: { color: '#e8b26b', fontSize: 12, marginTop: 6 },
+  buyListExportRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 12,
+  },
+  buyListExportBtn: {
+    backgroundColor: '#6C3CE1',
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  buyListExportBtnText: { color: '#fff', fontSize: 13, fontWeight: '700' },
+  buyListItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#0f0f1a',
+    borderRadius: 14,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: '#2a2a3e',
+    marginBottom: 10,
+  },
+  buyListThumb: {
+    width: 42,
+    height: 58,
+    borderRadius: 6,
+    marginRight: 12,
+  },
+  buyListInfo: { flex: 1 },
+  buyListName: { color: '#fff', fontSize: 14, fontWeight: '700' },
+  buyListMeta: { color: '#f3eee8', fontSize: 12, marginTop: 4 },
+  buyListType: { color: '#888', fontSize: 12, marginTop: 2 },
+  buyListPriceCol: { alignItems: 'flex-end', marginLeft: 12 },
+  buyListLineTotal: { color: '#7dcea0', fontSize: 13, fontWeight: '700' },
+  buyListUnitPrice: { color: '#888', fontSize: 11, marginTop: 2 },
+  buyListEmptyState: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 48,
+    paddingHorizontal: 24,
+  },
+  buyListEmptyTitle: { color: '#fff', fontSize: 18, fontWeight: '700', marginTop: 12 },
+  buyListEmptyText: { color: '#888', fontSize: 14, textAlign: 'center', marginTop: 8 },
   modalActions: {
     paddingHorizontal: 20,
     paddingTop: 12,
@@ -632,6 +1085,7 @@ const styles = StyleSheet.create({
     borderTopColor: '#2a2a3e',
   },
   cardDetailRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  ownershipDetailText: { color: '#aaa', fontSize: 13, textAlign: 'center' },
   qtyBadgeLarge: {
     backgroundColor: '#6C3CE1',
     borderRadius: 8,
@@ -658,4 +1112,22 @@ const styles = StyleSheet.create({
   },
   removeButtonText: { color: '#fff', fontSize: 15, fontWeight: '700' },
   buttonDisabled: { opacity: 0.55 },
+  toast: {
+    position: 'absolute',
+    left: 20,
+    right: 20,
+    bottom: Platform.OS === 'ios' ? 42 : 24,
+    backgroundColor: 'rgba(17, 24, 39, 0.96)',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#2a2a3e',
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  toastText: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
 });

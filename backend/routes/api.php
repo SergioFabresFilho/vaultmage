@@ -29,6 +29,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/chat/conversations/{conversation}/create-deck', [ChatController::class, 'createDeck']);
 
     Route::apiResource('decks', DeckController::class);
+    Route::get('/decks/{deck}/buy-list', [DeckController::class, 'buyList']);
     Route::post('/decks/{deck}/validate', [DeckController::class, 'validate']);
     Route::post('/decks/{deck}/cards', [DeckController::class, 'addCard']);
     Route::delete('/decks/{deck}/cards/{cardId}', [DeckController::class, 'removeCard']);

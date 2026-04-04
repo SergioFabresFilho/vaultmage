@@ -30,12 +30,25 @@ class DeckController extends Controller
         $totals = \Illuminate\Support\Facades\DB::table('deck_cards')
             ->join('cards', 'deck_cards.card_id', '=', 'cards.id')
             ->whereIn('deck_cards.deck_id', $deckIds)
-            ->whereNotNull('cards.price_usd')
             ->selectRaw('
                 deck_cards.deck_id,
-                SUM(cards.price_usd * deck_cards.quantity) as total_price,
+                SUM(CASE WHEN cards.price_usd IS NOT NULL
+                         THEN cards.price_usd * deck_cards.quantity ELSE 0 END) as total_price,
                 SUM(CASE WHEN collection.quantity IS NULL OR collection.quantity = 0
-                         THEN cards.price_usd * deck_cards.quantity ELSE 0 END) as missing_price
+                         THEN COALESCE(cards.price_usd, 0) * deck_cards.quantity
+                         WHEN collection.quantity < deck_cards.quantity
+                         THEN COALESCE(cards.price_usd, 0) * (deck_cards.quantity - collection.quantity)
+                         ELSE 0 END) as missing_price,
+                SUM(CASE WHEN collection.quantity IS NULL OR collection.quantity = 0
+                         THEN 0
+                         WHEN collection.quantity < deck_cards.quantity
+                         THEN collection.quantity
+                         ELSE deck_cards.quantity END) as owned_cards_count,
+                SUM(CASE WHEN collection.quantity IS NULL OR collection.quantity = 0
+                         THEN deck_cards.quantity
+                         WHEN collection.quantity < deck_cards.quantity
+                         THEN deck_cards.quantity - collection.quantity
+                         ELSE 0 END) as missing_cards_count
             ')
             ->leftJoin(
                 \Illuminate\Support\Facades\DB::raw('(SELECT card_id, quantity FROM collection_cards WHERE user_id = ' . $user->id . ') AS collection'),
@@ -58,6 +71,8 @@ class DeckController extends Controller
             $t = $totals->get($deck->id);
             $deck->total_price          = $t ? round((float) $t->total_price, 2) : null;
             $deck->missing_price        = $t ? round((float) $t->missing_price, 2) : null;
+            $deck->owned_cards_count    = $t ? (int) $t->owned_cards_count : 0;
+            $deck->missing_cards_count  = $t ? (int) $t->missing_cards_count : 0;
             $deck->commander_image_uri  = $commanderImages->get($deck->id)?->commander_image_uri ?? null;
             return $deck;
         });
@@ -90,12 +105,102 @@ class DeckController extends Controller
             abort(403);
         }
 
-        return $deck->load(['cards' => function ($query) {
-            $query->withPivot('quantity', 'is_sideboard')
-                  ->select('cards.id', 'cards.name', 'cards.type_line', 'cards.mana_cost',
+        $deck->load(['cards' => function ($query) {
+            $query->withPivot('quantity', 'is_sideboard', 'is_commander')
+                  ->select('cards.id', 'cards.name', 'cards.set_name', 'cards.type_line', 'cards.mana_cost',
                            'cards.image_uri', 'cards.color_identity', 'cards.rarity',
                            'cards.cmc', 'cards.price_usd');
         }]);
+
+        $ownedQuantities = Auth::user()
+            ->collection()
+            ->pluck('collection_cards.quantity', 'cards.id');
+
+        $deck->cards->each(function ($card) use ($ownedQuantities) {
+            $required = (int) $card->pivot->quantity;
+            $owned = (int) ($ownedQuantities[$card->id] ?? 0);
+
+            $card->setAttribute('quantity_required', $required);
+            $card->setAttribute('owned_quantity', $owned);
+            $card->setAttribute('missing_quantity', max(0, $required - $owned));
+        });
+
+        return $deck;
+    }
+
+    public function buyList(Deck $deck)
+    {
+        if ($deck->user_id !== Auth::id()) {
+            abort(403);
+        }
+
+        $deck->load(['cards' => function ($query) {
+            $query->withPivot('quantity', 'is_sideboard', 'is_commander')
+                ->select(
+                    'cards.id',
+                    'cards.name',
+                    'cards.set_name',
+                    'cards.type_line',
+                    'cards.mana_cost',
+                    'cards.image_uri',
+                    'cards.rarity',
+                    'cards.price_usd'
+                );
+        }]);
+
+        $ownedQuantities = Auth::user()
+            ->collection()
+            ->pluck('collection_cards.quantity', 'cards.id');
+
+        $items = $deck->cards
+            ->map(function ($card) use ($ownedQuantities) {
+                $required = (int) $card->pivot->quantity;
+                $owned = (int) ($ownedQuantities[$card->id] ?? 0);
+                $missing = max(0, $required - $owned);
+
+                if ($missing <= 0) {
+                    return null;
+                }
+
+                $unitPrice = $card->price_usd !== null ? (float) $card->price_usd : null;
+
+                return [
+                    'card_id' => $card->id,
+                    'name' => $card->name,
+                    'set_name' => $card->set_name,
+                    'type_line' => $card->type_line,
+                    'mana_cost' => $card->mana_cost,
+                    'image_uri' => $card->image_uri,
+                    'rarity' => $card->rarity,
+                    'quantity_required' => $required,
+                    'owned_quantity' => $owned,
+                    'missing_quantity' => $missing,
+                    'price_usd' => $unitPrice,
+                    'line_total' => $unitPrice !== null ? round($unitPrice * $missing, 2) : null,
+                    'is_commander' => (bool) $card->pivot->is_commander,
+                    'is_sideboard' => (bool) $card->pivot->is_sideboard,
+                ];
+            })
+            ->filter()
+            ->sortByDesc(fn (array $item) => [
+                $item['is_commander'] ? 1 : 0,
+                $item['line_total'] ?? 0,
+                $item['missing_quantity'],
+            ])
+            ->values();
+
+        $pricedItems = $items->filter(fn (array $item) => $item['line_total'] !== null);
+
+        return response()->json([
+            'deck_id' => $deck->id,
+            'deck_name' => $deck->name,
+            'format' => $deck->format,
+            'items' => $items->all(),
+            'missing_cards_count' => $items->sum('missing_quantity'),
+            'estimated_total' => round((float) $pricedItems->sum('line_total'), 2),
+            'priced_items_count' => $pricedItems->count(),
+            'unpriced_items_count' => $items->count() - $pricedItems->count(),
+        ]);
     }
 
     /**

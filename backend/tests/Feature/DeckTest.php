@@ -43,6 +43,27 @@ class DeckTest extends TestCase
         $response->assertStatus(200)->assertJsonPath('0.cards_sum_quantity', 1);
     }
 
+    public function test_index_includes_owned_and_missing_card_counts()
+    {
+        $deck = Deck::factory()->create(['user_id' => $this->user->id]);
+        $ownedCard = Card::factory()->create(['price_usd' => 2.50]);
+        $partialCard = Card::factory()->create(['price_usd' => 1.00]);
+
+        $deck->cards()->attach($ownedCard->id, ['quantity' => 2, 'is_sideboard' => false, 'is_commander' => false]);
+        $deck->cards()->attach($partialCard->id, ['quantity' => 3, 'is_sideboard' => false, 'is_commander' => false]);
+
+        $this->user->collection()->attach($ownedCard->id, ['quantity' => 2, 'foil' => false]);
+        $this->user->collection()->attach($partialCard->id, ['quantity' => 1, 'foil' => false]);
+
+        $response = $this->actingAs($this->user)->getJson('/api/decks');
+
+        $response->assertStatus(200)
+            ->assertJsonPath('0.owned_cards_count', 3)
+            ->assertJsonPath('0.missing_cards_count', 2)
+            ->assertJsonPath('0.total_price', 8)
+            ->assertJsonPath('0.missing_price', 2);
+    }
+
     public function test_it_creates_a_deck()
     {
         $response = $this->actingAs($this->user)->postJson('/api/decks', [
@@ -85,6 +106,53 @@ class DeckTest extends TestCase
             ->assertJsonPath('cards.0.pivot.quantity', 3);
     }
 
+    public function test_show_includes_owned_and_missing_quantities_for_fully_owned_card()
+    {
+        $deck = Deck::factory()->create(['user_id' => $this->user->id]);
+        $card = Card::factory()->create();
+
+        $deck->cards()->attach($card->id, ['quantity' => 2, 'is_sideboard' => false, 'is_commander' => false]);
+        $this->user->collection()->attach($card->id, ['quantity' => 2, 'foil' => false]);
+
+        $response = $this->actingAs($this->user)->getJson("/api/decks/{$deck->id}");
+
+        $response->assertStatus(200)
+            ->assertJsonPath('cards.0.quantity_required', 2)
+            ->assertJsonPath('cards.0.owned_quantity', 2)
+            ->assertJsonPath('cards.0.missing_quantity', 0);
+    }
+
+    public function test_show_includes_owned_and_missing_quantities_for_partially_owned_card()
+    {
+        $deck = Deck::factory()->create(['user_id' => $this->user->id]);
+        $card = Card::factory()->create();
+
+        $deck->cards()->attach($card->id, ['quantity' => 4, 'is_sideboard' => false, 'is_commander' => false]);
+        $this->user->collection()->attach($card->id, ['quantity' => 1, 'foil' => false]);
+
+        $response = $this->actingAs($this->user)->getJson("/api/decks/{$deck->id}");
+
+        $response->assertStatus(200)
+            ->assertJsonPath('cards.0.quantity_required', 4)
+            ->assertJsonPath('cards.0.owned_quantity', 1)
+            ->assertJsonPath('cards.0.missing_quantity', 3);
+    }
+
+    public function test_show_includes_owned_and_missing_quantities_for_missing_card()
+    {
+        $deck = Deck::factory()->create(['user_id' => $this->user->id]);
+        $card = Card::factory()->create();
+
+        $deck->cards()->attach($card->id, ['quantity' => 3, 'is_sideboard' => false, 'is_commander' => false]);
+
+        $response = $this->actingAs($this->user)->getJson("/api/decks/{$deck->id}");
+
+        $response->assertStatus(200)
+            ->assertJsonPath('cards.0.quantity_required', 3)
+            ->assertJsonPath('cards.0.owned_quantity', 0)
+            ->assertJsonPath('cards.0.missing_quantity', 3);
+    }
+
     public function test_show_returns_403_for_other_users_deck()
     {
         $deck = Deck::factory()->create();
@@ -92,6 +160,59 @@ class DeckTest extends TestCase
         $response = $this->actingAs($this->user)->getJson("/api/decks/{$deck->id}");
 
         $response->assertStatus(403);
+    }
+
+    public function test_buy_list_returns_only_missing_cards_with_estimated_total()
+    {
+        $deck = Deck::factory()->create(['user_id' => $this->user->id, 'name' => 'Budget Deck']);
+        $ownedCard = Card::factory()->create(['name' => 'Owned Card', 'price_usd' => 2.00]);
+        $partialCard = Card::factory()->create(['name' => 'Partial Card', 'price_usd' => 1.50]);
+        $missingCard = Card::factory()->create(['name' => 'Missing Card', 'price_usd' => 0.75]);
+
+        $deck->cards()->attach($ownedCard->id, ['quantity' => 2, 'is_sideboard' => false, 'is_commander' => false]);
+        $deck->cards()->attach($partialCard->id, ['quantity' => 3, 'is_sideboard' => false, 'is_commander' => false]);
+        $deck->cards()->attach($missingCard->id, ['quantity' => 4, 'is_sideboard' => false, 'is_commander' => false]);
+
+        $this->user->collection()->attach($ownedCard->id, ['quantity' => 2, 'foil' => false]);
+        $this->user->collection()->attach($partialCard->id, ['quantity' => 1, 'foil' => false]);
+
+        $response = $this->actingAs($this->user)->getJson("/api/decks/{$deck->id}/buy-list");
+
+        $response->assertStatus(200)
+            ->assertJsonPath('deck_name', 'Budget Deck')
+            ->assertJsonPath('missing_cards_count', 6)
+            ->assertJsonPath('estimated_total', 6)
+            ->assertJsonPath('priced_items_count', 2)
+            ->assertJsonPath('unpriced_items_count', 0)
+            ->assertJsonCount(2, 'items')
+            ->assertJsonFragment([
+                'name' => 'Partial Card',
+                'missing_quantity' => 2,
+                'line_total' => 3,
+            ])
+            ->assertJsonFragment([
+                'name' => 'Missing Card',
+                'missing_quantity' => 4,
+                'line_total' => 3,
+            ]);
+    }
+
+    public function test_buy_list_tracks_unpriced_missing_cards()
+    {
+        $deck = Deck::factory()->create(['user_id' => $this->user->id]);
+        $unpricedCard = Card::factory()->create(['price_usd' => null]);
+
+        $deck->cards()->attach($unpricedCard->id, ['quantity' => 2, 'is_sideboard' => false, 'is_commander' => false]);
+
+        $response = $this->actingAs($this->user)->getJson("/api/decks/{$deck->id}/buy-list");
+
+        $response->assertStatus(200)
+            ->assertJsonPath('missing_cards_count', 2)
+            ->assertJsonPath('estimated_total', 0)
+            ->assertJsonPath('priced_items_count', 0)
+            ->assertJsonPath('unpriced_items_count', 1)
+            ->assertJsonPath('items.0.missing_quantity', 2)
+            ->assertJsonPath('items.0.line_total', null);
     }
 
     public function test_it_updates_a_deck()
