@@ -2,7 +2,8 @@ import { API_BASE_URL } from '@/lib/api';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 import { useFocusEffect } from 'expo-router';
-import { useCallback, useRef, useState } from 'react';
+import { Accelerometer } from 'expo-sensors';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Animated, ActivityIndicator, Alert, Dimensions, Image, Modal, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { useAuth } from '@/context/AuthContext';
 
@@ -26,6 +27,29 @@ export default function ScanScreen() {
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const toastOpacity = useRef(new Animated.Value(0)).current;
+  const cornerReadyOpacity = useRef(new Animated.Value(0)).current;
+
+  // Refs so callbacks can read current state without stale closures
+  const scanningRef = useRef(false);
+  const identifiedCardRef = useRef<IdentifiedCard | null>(null);
+
+  // Accelerometer-based stability detection
+  // We track the last N acceleration readings; if the variance stays below a threshold
+  // for STABLE_DURATION_MS, we consider the phone still and fire an auto-scan.
+  const ACCEL_SAMPLE_INTERVAL_MS = 100;
+  const STABLE_DURATION_MS = 1000; // phone must be still for this long
+  const STABLE_THRESHOLD = 0.05;   // max delta in g-force to count as still (~normal hand tremor)
+  const samplesNeeded = Math.ceil(STABLE_DURATION_MS / ACCEL_SAMPLE_INTERVAL_MS);
+
+  const lastAccelRef = useRef<{ x: number; y: number; z: number } | null>(null);
+  const stableSamplesRef = useRef(0);
+  const alertOpenRef = useRef(false);
+
+  function showAlert(title: string, message: string) {
+    alertOpenRef.current = true;
+    stableSamplesRef.current = 0;
+    Alert.alert(title, message, [{ text: 'OK', onPress: () => { alertOpenRef.current = false; } }]);
+  }
 
   function showToast(message: string) {
     setToastMessage(message);
@@ -42,6 +66,55 @@ export default function ScanScreen() {
       return () => setIsCameraActive(false);
     }, [])
   );
+
+  useEffect(() => {
+    if (!isCameraActive) return;
+
+    stableSamplesRef.current = 0;
+    lastAccelRef.current = null;
+
+    Accelerometer.setUpdateInterval(ACCEL_SAMPLE_INTERVAL_MS);
+
+    const subscription = Accelerometer.addListener(({ x, y, z }) => {
+      if (scanningRef.current || identifiedCardRef.current || alertOpenRef.current) {
+        // Reset stability counter while a scan is in progress, modal is open, or alert is showing
+        stableSamplesRef.current = 0;
+        lastAccelRef.current = { x, y, z };
+        return;
+      }
+
+      const prev = lastAccelRef.current;
+      lastAccelRef.current = { x, y, z };
+
+      if (!prev) return;
+
+      const delta = Math.sqrt(
+        Math.pow(x - prev.x, 2) +
+        Math.pow(y - prev.y, 2) +
+        Math.pow(z - prev.z, 2)
+      );
+
+      if (delta < STABLE_THRESHOLD) {
+        stableSamplesRef.current += 1;
+      } else {
+        stableSamplesRef.current = 0;
+      }
+
+      if (stableSamplesRef.current >= samplesNeeded) {
+        // Reset so we don't fire again immediately after this scan
+        stableSamplesRef.current = 0;
+        // Flash corners green to signal auto-scan
+        Animated.sequence([
+          Animated.timing(cornerReadyOpacity, { toValue: 1, duration: 150, useNativeDriver: true }),
+          Animated.timing(cornerReadyOpacity, { toValue: 0, duration: 250, useNativeDriver: true }),
+        ]).start();
+        handleScan();
+      }
+    });
+
+    return () => subscription.remove();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isCameraActive]);
 
   if (!permission) {
     return <View style={styles.container} />;
@@ -73,9 +146,10 @@ export default function ScanScreen() {
   }
 
   async function handleScan() {
-    if (!cameraRef.current || scanning) return;
+    if (!cameraRef.current || scanningRef.current) return;
     triggerShutter();
     setScanning(true);
+    scanningRef.current = true;
     const startedAt = Date.now();
     try {
       const captureStartedAt = Date.now();
@@ -165,18 +239,20 @@ export default function ScanScreen() {
       if (!response.ok) {
         const message = data?.message ?? data?.errors?.image?.[0] ?? 'Scan failed.';
         console.error('[scan] API error:', { status: response.status, message, errors: data?.errors });
-        Alert.alert('Could not identify card', message);
+        showAlert('Could not identify card', message);
         return;
       }
 
-      setIdentifiedCard({
+      const card = {
         scryfall_id: data.scryfall_id,
         name: data.name,
         set_name: data.set_name,
         type_line: data.type_line,
         rarity: data.rarity,
         image_uri: data.image_uri ?? null,
-      });
+      };
+      setIdentifiedCard(card);
+      identifiedCardRef.current = card;
       console.log('[scan] result', {
         name: data.name,
         set_code: data.set_code,
@@ -184,9 +260,10 @@ export default function ScanScreen() {
       });
     } catch (e: any) {
       console.error('[scan] Unexpected error during scan:', e);
-      Alert.alert('Error', e.message ?? 'Something went wrong.');
+      showAlert('Error', e.message ?? 'Something went wrong.');
     } finally {
       setScanning(false);
+      scanningRef.current = false;
     }
   }
 
@@ -205,6 +282,7 @@ export default function ScanScreen() {
         return;
       }
       setIdentifiedCard(null);
+      identifiedCardRef.current = null;
       showToast(`${identifiedCard.name} added to your collection.`);
     } catch (e: any) {
       Alert.alert('Error', e.message ?? 'Something went wrong.');
@@ -225,6 +303,11 @@ export default function ScanScreen() {
               <View style={[styles.corner, styles.topRight]} />
               <View style={[styles.corner, styles.bottomLeft]} />
               <View style={[styles.corner, styles.bottomRight]} />
+              {/* Green flash overlay on corners when auto-scan fires */}
+              <Animated.View style={[styles.corner, styles.topLeft, styles.cornerReady, { opacity: cornerReadyOpacity }]} />
+              <Animated.View style={[styles.corner, styles.topRight, styles.cornerReady, { opacity: cornerReadyOpacity }]} />
+              <Animated.View style={[styles.corner, styles.bottomLeft, styles.cornerReady, { opacity: cornerReadyOpacity }]} />
+              <Animated.View style={[styles.corner, styles.bottomRight, styles.cornerReady, { opacity: cornerReadyOpacity }]} />
             </View>
           </View>
         </View>
@@ -238,7 +321,7 @@ export default function ScanScreen() {
 
       <View style={styles.hint}>
         <Text style={styles.hintText}>
-          {scanning ? 'Identifying card…' : 'Align card within the frame'}
+          {scanning ? 'Identifying card…' : 'Align card and hold still'}
         </Text>
       </View>
 
@@ -278,7 +361,7 @@ export default function ScanScreen() {
             <View style={styles.modalActions}>
               <TouchableOpacity
                 style={[styles.modalButton, styles.modalButtonSecondary]}
-                onPress={() => setIdentifiedCard(null)}
+                onPress={() => { setIdentifiedCard(null); identifiedCardRef.current = null; }}
                 disabled={saving}
               >
                 <Text style={styles.modalButtonSecondaryText}>Re-scan</Text>
@@ -484,6 +567,9 @@ const styles = StyleSheet.create({
     borderRightWidth: CORNER_THICKNESS,
     borderColor: CORNER_COLOR,
     borderBottomRightRadius: 4,
+  },
+  cornerReady: {
+    borderColor: '#4ade80',
   },
 
   // Shutter flash

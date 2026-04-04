@@ -88,6 +88,9 @@ class ScryfallService
     /**
      * Find a card by name (fuzzy) and optional set code.
      *
+     * Falls back to name-only lookup if set-constrained lookup fails, then falls
+     * back to a broader search (handles non-English printed names and OCR'd set codes).
+     *
      * @return array{scryfall_id:string, name:string, set_code:string, set_name:string, collector_number:string, rarity:string, mana_cost:string|null, oracle_text:string|null, cmc:float|int|null, type_line:string, image_uri:string|null}
      *
      * @throws RuntimeException when card is not found
@@ -97,32 +100,82 @@ class ScryfallService
         $cacheKey = 'scryfall:' . strtolower($name) . ($setCode ? ':' . strtolower($setCode) : '');
 
         return Cache::rememberForever($cacheKey, function () use ($name, $setCode) {
-            $params = ['fuzzy' => $name];
+            $card = $this->tryNamedLookup($name, $setCode);
 
-            if ($setCode) {
-                $params['set'] = strtolower($setCode);
+            // If the set-constrained lookup failed, retry without the set code.
+            if ($card === null && $setCode !== null) {
+                Log::info('Scryfall named lookup failed with set code, retrying without', ['name' => $name, 'set_code' => $setCode]);
+                $card = $this->tryNamedLookup($name, null);
             }
 
-            $response = Http::baseUrl(self::BASE_URL)
-                ->withHeaders([
-                    'User-Agent' => 'VaultMage/1.0 (contact@vaultmage.app)',
-                    'Accept'     => 'application/json;q=0.9,*/*;q=0.8',
-                ])
-                ->get('/cards/named', $params);
+            // Last resort: broader search (handles non-English printed names).
+            if ($card === null) {
+                $card = $this->searchByName($name);
+            }
 
-            if ($response->status() === 404) {
+            if ($card === null) {
                 Log::warning('Scryfall card not found', ['name' => $name, 'set_code' => $setCode]);
                 throw new RuntimeException("Card not found: \"{$name}\"" . ($setCode ? " in set {$setCode}" : ''));
             }
 
-            if (! $response->ok()) {
-                $detail = $response->json('details') ?? $response->json('message') ?? 'Unknown Scryfall error';
-                Log::error('Scryfall API request failed', ['name' => $name, 'set_code' => $setCode, 'status' => $response->status(), 'detail' => $detail]);
-                throw new RuntimeException("Scryfall error ({$response->status()}): {$detail}");
-            }
-
-            return $this->mapCardData($response->json());
+            return $card;
         });
+    }
+
+    /**
+     * Attempt a /cards/named fuzzy lookup. Returns null on 404, throws on other errors.
+     */
+    private function tryNamedLookup(string $name, ?string $setCode): ?array
+    {
+        $params = ['fuzzy' => $name];
+
+        if ($setCode) {
+            $params['set'] = strtolower($setCode);
+        }
+
+        $response = Http::baseUrl(self::BASE_URL)
+            ->withHeaders([
+                'User-Agent' => 'VaultMage/1.0 (contact@vaultmage.app)',
+                'Accept'     => 'application/json;q=0.9,*/*;q=0.8',
+            ])
+            ->get('/cards/named', $params);
+
+        if ($response->status() === 404) {
+            return null;
+        }
+
+        if (! $response->ok()) {
+            $detail = $response->json('details') ?? $response->json('message') ?? 'Unknown Scryfall error';
+            Log::error('Scryfall API request failed', ['name' => $name, 'set_code' => $setCode, 'status' => $response->status(), 'detail' => $detail]);
+            throw new RuntimeException("Scryfall error ({$response->status()}): {$detail}");
+        }
+
+        return $this->mapCardData($response->json());
+    }
+
+    /**
+     * Search for a card by name using the /cards/search endpoint.
+     * Returns the first match, or null if none found.
+     */
+    private function searchByName(string $name): ?array
+    {
+        $response = Http::baseUrl(self::BASE_URL)
+            ->withHeaders([
+                'User-Agent' => 'VaultMage/1.0 (contact@vaultmage.app)',
+                'Accept'     => 'application/json;q=0.9,*/*;q=0.8',
+            ])
+            ->get('/cards/search', [
+                'q'      => '!"' . $name . '"',
+                'unique' => 'cards',
+            ]);
+
+        if (! $response->ok()) {
+            return null;
+        }
+
+        $data = $response->json('data');
+
+        return ! empty($data) ? $this->mapCardData($data[0]) : null;
     }
 
     /**
