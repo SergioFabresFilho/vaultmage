@@ -103,6 +103,14 @@ type BuyList = {
   estimated_total: number;
   priced_items_count: number;
   unpriced_items_count: number;
+  budget: number | null;
+  budget_remaining: number | null;
+  recommended_total: number;
+  groups: {
+    must_buy: BuyListItem[];
+    optional: BuyListItem[];
+    deferred: BuyListItem[];
+  };
 };
 
 type Section = {
@@ -204,21 +212,40 @@ function ownershipStyle(card: Card) {
 }
 
 function buildBuyListExportText(buyList: BuyList): string {
+  const sections = [
+    { label: 'Must Buy', items: buyList.groups.must_buy },
+    { label: 'Optional', items: buyList.groups.optional },
+    { label: 'Deferred', items: buyList.groups.deferred },
+  ];
+
   const lines = [
     `${buyList.deck_name} Buy List`,
     buyList.format ? `Format: ${buyList.format}` : null,
     `Missing cards: ${buyList.missing_cards_count}`,
     `Estimated total: $${buyList.estimated_total.toFixed(2)}`,
+    buyList.budget != null ? `Budget: $${buyList.budget.toFixed(2)}` : null,
+    buyList.budget != null ? `Recommended total: $${buyList.recommended_total.toFixed(2)}` : null,
+    buyList.budget_remaining != null ? `Budget remaining: $${buyList.budget_remaining.toFixed(2)}` : null,
     buyList.unpriced_items_count > 0
       ? `Unpriced items: ${buyList.unpriced_items_count}`
       : null,
     '',
-    ...buyList.items.map((item) => {
-      const priceText = item.line_total != null
-        ? ` - $${item.line_total.toFixed(2)} total`
-        : ' - no price';
+    ...sections.flatMap((section) => {
+      if (section.items.length === 0) {
+        return [];
+      }
 
-      return `${item.missing_quantity}x ${item.name}${priceText}`;
+      return [
+        `${section.label}:`,
+        ...section.items.map((item) => {
+          const priceText = item.line_total != null
+            ? ` - $${item.line_total.toFixed(2)} total`
+            : ' - no price';
+
+          return `${item.missing_quantity}x ${item.name}${priceText}`;
+        }),
+        '',
+      ];
     }),
   ];
 
@@ -299,6 +326,7 @@ export default function DeckViewScreen() {
   const [buyList, setBuyList] = useState<BuyList | null>(null);
   const [buyListVisible, setBuyListVisible] = useState(false);
   const [buyListLoading, setBuyListLoading] = useState(false);
+  const [buyListBudget, setBuyListBudget] = useState<number | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const toastOpacity = useRef(new Animated.Value(0)).current;
 
@@ -376,11 +404,12 @@ export default function DeckViewScreen() {
     }
   }
 
-  async function openBuyList() {
+  async function openBuyList(nextBudget: number | null = buyListBudget, openModal: boolean = true) {
     setBuyListLoading(true);
 
     try {
-      const res = await fetch(`${API_BASE_URL}/api/decks/${id}/buy-list`, {
+      const query = nextBudget != null ? `?budget=${encodeURIComponent(nextBudget.toFixed(2))}` : '';
+      const res = await fetch(`${API_BASE_URL}/api/decks/${id}/buy-list${query}`, {
         headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
       });
 
@@ -390,7 +419,10 @@ export default function DeckViewScreen() {
 
       const data: BuyList = await res.json();
       setBuyList(data);
-      setBuyListVisible(true);
+      setBuyListBudget(data.budget);
+      if (openModal) {
+        setBuyListVisible(true);
+      }
     } catch {
       Alert.alert('Error', 'Failed to load the buy list for this deck.');
     } finally {
@@ -446,6 +478,10 @@ export default function DeckViewScreen() {
     } catch {
       Alert.alert('Error', 'Failed to export the buy list CSV.');
     }
+  }
+
+  async function applyBuyListBudget(nextBudget: number | null) {
+    await openBuyList(nextBudget, false);
   }
 
   function confirmDeleteDeck() {
@@ -536,7 +572,7 @@ export default function DeckViewScreen() {
 
       <TouchableOpacity
         style={[styles.buyListBtn, buyListLoading && styles.buttonDisabled]}
-        onPress={openBuyList}
+        onPress={() => void openBuyList()}
         disabled={buyListLoading}
       >
         {buyListLoading ? (
@@ -706,6 +742,34 @@ export default function DeckViewScreen() {
                   {buyList?.missing_cards_count ?? 0} missing card{(buyList?.missing_cards_count ?? 0) === 1 ? '' : 's'}
                 </Text>
                 <Text style={styles.buyListSummaryTotal}>Estimated total: ${(buyList?.estimated_total ?? 0).toFixed(2)}</Text>
+                <View style={styles.budgetChipRow}>
+                  {[
+                    { label: 'No budget', value: null },
+                    { label: '$10', value: 10 },
+                    { label: '$25', value: 25 },
+                    { label: '$50', value: 50 },
+                  ].map((option) => {
+                    const selected = buyListBudget === option.value;
+                    return (
+                      <TouchableOpacity
+                        key={option.label}
+                        style={[styles.budgetChip, selected ? styles.budgetChipSelected : null, buyListLoading ? styles.buttonDisabled : null]}
+                        onPress={() => applyBuyListBudget(option.value)}
+                        disabled={buyListLoading}
+                      >
+                        <Text style={[styles.budgetChipText, selected ? styles.budgetChipTextSelected : null]}>
+                          {option.label}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+                {buyList?.budget != null ? (
+                  <>
+                    <Text style={styles.buyListSummaryMeta}>Recommended under budget: ${buyList.recommended_total.toFixed(2)}</Text>
+                    <Text style={styles.buyListSummaryMeta}>Budget remaining: ${(buyList.budget_remaining ?? 0).toFixed(2)}</Text>
+                  </>
+                ) : null}
                 {(buyList?.unpriced_items_count ?? 0) > 0 ? (
                   <Text style={styles.buyListSummaryHint}>
                     {buyList?.unpriced_items_count} item{buyList?.unpriced_items_count === 1 ? '' : 's'} missing price data.
@@ -730,31 +794,42 @@ export default function DeckViewScreen() {
               </View>
 
               {buyList?.items.length ? (
-                buyList.items.map((item) => (
-                  <View key={`${item.card_id}-${item.name}`} style={styles.buyListItem}>
-                    {item.image_uri ? (
-                      <Image source={{ uri: item.image_uri }} style={styles.buyListThumb} resizeMode="cover" />
-                    ) : (
-                      <View style={[styles.buyListThumb, styles.cardThumbPlaceholder]}>
-                        <Ionicons name="image-outline" size={18} color="#433647" />
-                      </View>
-                    )}
-                    <View style={styles.buyListInfo}>
-                      <Text style={styles.buyListName}>{item.name}</Text>
-                      <Text style={styles.buyListMeta}>
-                        Need {item.missing_quantity} · Own {item.owned_quantity} / {item.quantity_required}
-                      </Text>
-                      <Text style={styles.buyListType} numberOfLines={1}>{item.type_line}</Text>
+                [
+                  { key: 'must_buy', title: 'Must Buy', items: buyList.groups.must_buy },
+                  { key: 'optional', title: 'Optional', items: buyList.groups.optional },
+                  { key: 'deferred', title: 'Deferred', items: buyList.groups.deferred },
+                ].map((section) => (
+                  section.items.length ? (
+                    <View key={section.key} style={styles.buyListSection}>
+                      <Text style={styles.buyListSectionTitle}>{section.title}</Text>
+                      {section.items.map((item) => (
+                        <View key={`${section.key}-${item.card_id}-${item.name}`} style={styles.buyListItem}>
+                          {item.image_uri ? (
+                            <Image source={{ uri: item.image_uri }} style={styles.buyListThumb} resizeMode="cover" />
+                          ) : (
+                            <View style={[styles.buyListThumb, styles.cardThumbPlaceholder]}>
+                              <Ionicons name="image-outline" size={18} color="#433647" />
+                            </View>
+                          )}
+                          <View style={styles.buyListInfo}>
+                            <Text style={styles.buyListName}>{item.name}</Text>
+                            <Text style={styles.buyListMeta}>
+                              Need {item.missing_quantity} · Own {item.owned_quantity} / {item.quantity_required}
+                            </Text>
+                            <Text style={styles.buyListType} numberOfLines={1}>{item.type_line}</Text>
+                          </View>
+                          <View style={styles.buyListPriceCol}>
+                            <Text style={styles.buyListLineTotal}>
+                              {item.line_total != null ? `$${item.line_total.toFixed(2)}` : 'No price'}
+                            </Text>
+                            {item.price_usd != null ? (
+                              <Text style={styles.buyListUnitPrice}>${item.price_usd.toFixed(2)} each</Text>
+                            ) : null}
+                          </View>
+                        </View>
+                      ))}
                     </View>
-                    <View style={styles.buyListPriceCol}>
-                      <Text style={styles.buyListLineTotal}>
-                        {item.line_total != null ? `$${item.line_total.toFixed(2)}` : 'No price'}
-                      </Text>
-                      {item.price_usd != null ? (
-                        <Text style={styles.buyListUnitPrice}>${item.price_usd.toFixed(2)} each</Text>
-                      ) : null}
-                    </View>
-                  </View>
+                  ) : null
                 ))
               ) : (
                 <View style={styles.buyListEmptyState}>
@@ -1031,11 +1106,48 @@ const styles = StyleSheet.create({
   buyListSummaryMeta: { color: '#aaa', fontSize: 13, marginTop: 4 },
   buyListSummaryTotal: { color: '#7dcea0', fontSize: 15, fontWeight: '700', marginTop: 8 },
   buyListSummaryHint: { color: '#e8b26b', fontSize: 12, marginTop: 6 },
+  budgetChipRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 12,
+  },
+  budgetChip: {
+    backgroundColor: '#1a1a2e',
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: '#2a2a3e',
+  },
+  budgetChipSelected: {
+    backgroundColor: '#6C3CE1',
+    borderColor: '#6C3CE1',
+  },
+  budgetChipText: {
+    color: '#ccc',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  budgetChipTextSelected: {
+    color: '#fff',
+  },
   buyListExportRow: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     gap: 8,
     marginTop: 12,
+  },
+  buyListSection: {
+    marginBottom: 16,
+  },
+  buyListSectionTitle: {
+    color: '#f3eee8',
+    fontSize: 13,
+    fontWeight: '800',
+    textTransform: 'uppercase',
+    letterSpacing: 0.6,
+    marginBottom: 8,
   },
   buyListExportBtn: {
     backgroundColor: '#6C3CE1',

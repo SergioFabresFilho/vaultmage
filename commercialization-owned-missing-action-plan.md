@@ -1,5 +1,30 @@
 # Owned vs Missing Foundation Action Plan
 
+## Completion
+
+Status: Completed
+
+Delivered:
+
+- canonical owned/missing deck payload fields
+- deck detail owned/missing UI
+- deck list completion status UI
+- first-class deck buy-list flow
+- budget-aware buy-list prioritization
+- text share, clipboard copy, and CSV export
+- backend test coverage for ownership, buy-list, and budget behavior
+
+## Status
+
+- [x] Canonical owned/missing fields added to deck payloads
+- [x] Deck detail UI updated to show owned/missing state
+- [x] Deck list UI updated to show completion status
+- [x] Deck buy-list flow added for missing cards
+- [x] Budget-aware buy-list prioritization added
+- [x] Copy/share/CSV export added for the buy list
+- [x] Backend tests added for ownership and buy-list behavior
+- [ ] Manual UX validation pass completed
+
 ## Objective
 
 Make owned-vs-missing card status a first-class product capability in VaultMage so deck views, AI improvements, and future buy-list generation all rely on the same backend truth.
@@ -28,11 +53,12 @@ Out of scope for this slice:
 
 ## Current State
 
-- deck list responses already compute aggregate `missing_price`
-- AI deck improvement tools already compute owned and missing quantities internally
-- deck detail responses do not expose owned or missing quantities per card
-- deck detail UI does not show which cards are already owned versus missing
-- buy recommendations exist only as AI proposal output, not as a first-class model
+- deck list responses compute aggregate `missing_price` and deck completion counts
+- AI deck improvement tools compute owned and missing quantities internally
+- deck detail responses expose owned and missing quantities per card
+- deck detail UI shows which cards are already owned versus missing
+- deck buy lists exist as a first-class backend response and UI flow
+- buy lists support grouped `must buy`, `optional`, and `deferred` sections under a budget cap
 
 ## Target Outcome
 
@@ -47,58 +73,58 @@ After this slice:
 
 ### 1. Define the canonical deck ownership contract
 
-- update the deck show response so each card includes:
+- [x] update the deck show response so each card includes:
   - `quantity_required`
   - `owned_quantity`
   - `missing_quantity`
-- keep existing pivot quantity data for compatibility unless it creates confusion
-- document the intended meaning:
+- [x] keep existing pivot quantity data for compatibility unless it creates confusion
+- [x] document the intended meaning:
   - `quantity_required` = copies needed by the deck
   - `owned_quantity` = copies in the user's collection
   - `missing_quantity` = `max(0, quantity_required - owned_quantity)`
 
 ### 2. Update backend deck retrieval
 
-- modify [`backend/app/Http/Controllers/Api/DeckController.php`](/Users/sergiosanchesfabresfilho/ssff/ssff/vaultmage/backend/app/Http/Controllers/Api/DeckController.php) so `show()` joins or maps collection quantities for the authenticated user
-- ensure the response includes ownership fields for all deck cards
-- preserve existing authorization and deck-loading behavior
-- avoid duplicating logic later by keeping the ownership computation isolated and reusable
+- [x] modify [`backend/app/Http/Controllers/Api/DeckController.php`](/Users/sergiosanchesfabresfilho/ssff/ssff/vaultmage/backend/app/Http/Controllers/Api/DeckController.php) so `show()` joins or maps collection quantities for the authenticated user
+- [x] ensure the response includes ownership fields for all deck cards
+- [x] preserve existing authorization and deck-loading behavior
+- [ ] avoid duplicating logic later by keeping the ownership computation isolated and reusable
 
 ### 3. Align deck-level pricing semantics
 
-- verify that deck totals remain correct
-- keep total deck price as full deck completion cost
-- keep missing price as only the cost of cards not owned
-- confirm the per-card payload is sufficient for a future buy-list calculation without re-deriving ownership elsewhere
+- [x] verify that deck totals remain correct
+- [x] keep total deck price as full deck completion cost
+- [x] keep missing price as only the cost of cards not owned
+- [x] confirm the per-card payload is sufficient for a future buy-list calculation without re-deriving ownership elsewhere
 
 ### 4. Update deck detail UI
 
-- modify [`mobile/app/deck/[id].tsx`](/Users/sergiosanchesfabresfilho/ssff/ssff/vaultmage/mobile/app/deck/[id].tsx) to render owned/missing status per card
-- show clear, compact status indicators such as:
+- [x] modify [`mobile/app/deck/[id].tsx`](/Users/sergiosanchesfabresfilho/ssff/ssff/vaultmage/mobile/app/deck/[id].tsx) to render owned/missing status per card
+- [x] show clear, compact status indicators such as:
   - `Own 1 / Need 1`
   - `Missing 2`
   - `Complete`
-- surface missing-state information in both:
+- [x] surface missing-state information in both:
   - card rows
   - card detail modal
-- preserve the current deck browsing flow and avoid turning this screen into a full buy-list UI yet
+- [x] extend the deck browsing flow into a first-class buy-list experience
 
 ### 5. Add tests
 
-- extend backend feature coverage for deck responses
-- add tests that verify:
+- [x] extend backend feature coverage for deck responses
+- [x] add tests that verify:
   - owned quantity is returned when a user has the card
   - missing quantity is zero when owned copies cover deck demand
   - missing quantity is positive when deck demand exceeds collection quantity
   - missing quantity is correct when the user owns none of the card
-- add regression coverage for aggregate price semantics if needed
+- [x] add regression coverage for aggregate price semantics if needed
 
 ### 6. Validate UX behavior
 
-- manually verify a deck with all cards owned
-- manually verify a deck with partially owned playsets
-- manually verify a deck with fully missing cards
-- confirm the screen remains readable on mobile with mixed ownership states
+- [ ] manually verify a deck with all cards owned
+- [ ] manually verify a deck with partially owned playsets
+- [ ] manually verify a deck with fully missing cards
+- [ ] confirm the screen remains readable on mobile with mixed ownership states
 
 ## Suggested Task Order
 
@@ -110,11 +136,11 @@ After this slice:
 
 ## Acceptance Criteria
 
-- opening a deck shows ownership status for every card
-- the backend deck response includes per-card ownership fields
-- missing quantities are accurate for zero-owned, partial-owned, and fully-owned cases
-- total deck price and missing price semantics remain intact
-- the implementation creates a clean foundation for future buy-list generation
+- [x] opening a deck shows ownership status for every card
+- [x] the backend deck response includes per-card ownership fields
+- [x] missing quantities are accurate for zero-owned, partial-owned, and fully-owned cases
+- [x] total deck price and missing price semantics remain intact
+- [x] the implementation creates a clean foundation for future buy-list generation
 
 ## Risks
 
@@ -122,10 +148,8 @@ After this slice:
 - payload shape drift between mobile assumptions and backend responses
 - confusing UI labels if `pivot.quantity` and `quantity_required` are both displayed without care
 
-## Follow-On Work After This Slice
+## Follow-On Work
 
-- introduce a canonical buy-list model
-- generate buy lists from deck state and AI proposals
-- split buy lists into must-buy, optional, and luxury upgrades
-- add budget-aware prioritization
-- add export and external purchase flows
+- manual UX validation across owned, partial-owned, and fully missing deck scenarios
+- refactor shared ownership and buy-list logic into reusable backend helpers/services
+- continue commercialization work from [`commercialization-implementation-todo.md`](/Users/sergiosanchesfabresfilho/ssff/ssff/vaultmage/commercialization-implementation-todo.md)

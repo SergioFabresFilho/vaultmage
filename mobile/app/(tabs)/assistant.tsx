@@ -43,8 +43,28 @@ type ProposalCard = {
   image_uri: string | null;
   quantity: number;
   owned_quantity: number;
+  price_usd?: number | null;
+  line_total?: number | null;
+  priority?: string | null;
+  category?: string | null;
   role: string | null;
   reason: string | null;
+};
+
+type ProposalBuyList = {
+  items: ProposalCard[];
+  missing_cards_count: number;
+  estimated_total: number;
+  priced_items_count: number;
+  unpriced_items_count: number;
+  budget: number | null;
+  budget_remaining: number | null;
+  recommended_total: number;
+  groups: {
+    must_buy: ProposalCard[];
+    optional: ProposalCard[];
+    deferred: ProposalCard[];
+  };
 };
 
 type DeckProposal = {
@@ -56,6 +76,7 @@ type DeckProposal = {
   added_cards?: ProposalCard[];
   removed_cards?: ProposalCard[];
   buy_cards?: ProposalCard[];
+  buy_list?: ProposalBuyList;
   draft_deck_id?: number | null;
   validation_message?: string | null;
 };
@@ -181,6 +202,7 @@ function ProposalBubble({
   const addedCards = proposal.added_cards ?? [];
   const removedCards = proposal.removed_cards ?? [];
   const buyCards = proposal.buy_cards ?? [];
+  const buyList = proposal.buy_list;
   const isChangeProposal = proposal.proposal_type === 'changes';
   const hasValidationIssues = Boolean(proposal.validation_message);
   const hasDiffView = isChangeProposal || addedCards.length > 0 || removedCards.length > 0 || buyCards.length > 0;
@@ -278,6 +300,30 @@ function ProposalBubble({
                 <Text style={styles.changeSectionTitle}>Worth Buying</Text>
               </View>
               {buyCards.map((card) => renderCardRow(card, 'added'))}
+            </View>
+          ) : null}
+          {buyList ? (
+            <View style={styles.changeSection}>
+              <View style={styles.changeSectionHeader}>
+                <Ionicons name="wallet" size={16} color="#7dd3fc" />
+                <Text style={styles.changeSectionTitle}>Buy List</Text>
+              </View>
+              <Text style={styles.buyListSummaryText}>
+                {buyList.missing_cards_count} missing cards · ${buyList.estimated_total.toFixed(2)} total
+                {buyList.budget != null ? ` · $${buyList.recommended_total.toFixed(2)} under $${buyList.budget.toFixed(2)}` : ''}
+              </Text>
+              {[
+                { key: 'must_buy', title: 'Must Buy', items: buyList.groups.must_buy },
+                { key: 'optional', title: 'Optional', items: buyList.groups.optional },
+                { key: 'deferred', title: 'Deferred', items: buyList.groups.deferred },
+              ].map((section) => (
+                section.items.length > 0 ? (
+                  <View key={section.key} style={styles.buyListSection}>
+                    <Text style={styles.buyListSectionTitle}>{section.title}</Text>
+                    {section.items.map((card) => renderCardRow(card, 'added'))}
+                  </View>
+                ) : null
+              ))}
             </View>
           ) : null}
         </>
@@ -1960,6 +2006,24 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     textTransform: 'uppercase',
     letterSpacing: 0.4,
+  },
+  buyListSummaryText: {
+    color: '#93c5fd',
+    fontSize: 12,
+    lineHeight: 17,
+    marginBottom: 8,
+  },
+  buyListSection: {
+    marginTop: 6,
+    marginBottom: 6,
+  },
+  buyListSectionTitle: {
+    color: '#cbd5e1',
+    fontSize: 12,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+    letterSpacing: 0.4,
+    marginBottom: 4,
   },
   proposalCardRow: {
     flexDirection: 'row',

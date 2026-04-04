@@ -215,6 +215,40 @@ class DeckTest extends TestCase
             ->assertJsonPath('items.0.line_total', null);
     }
 
+    public function test_buy_list_applies_budget_and_groups_recommendations()
+    {
+        $deck = Deck::factory()->create(['user_id' => $this->user->id]);
+        $commanderCard = Card::factory()->create(['name' => 'Commander Card', 'price_usd' => 1.00]);
+        $mainboardCard = Card::factory()->create(['name' => 'Mainboard Card', 'price_usd' => 2.00]);
+        $sideboardCard = Card::factory()->create(['name' => 'Sideboard Card', 'price_usd' => 0.50]);
+
+        $deck->cards()->attach($commanderCard->id, ['quantity' => 1, 'is_sideboard' => false, 'is_commander' => true]);
+        $deck->cards()->attach($mainboardCard->id, ['quantity' => 1, 'is_sideboard' => false, 'is_commander' => false]);
+        $deck->cards()->attach($sideboardCard->id, ['quantity' => 2, 'is_sideboard' => true, 'is_commander' => false]);
+
+        $response = $this->actingAs($this->user)->getJson("/api/decks/{$deck->id}/buy-list?budget=2.50");
+
+        $response->assertStatus(200)
+            ->assertJsonPath('budget', 2.5)
+            ->assertJsonPath('budget_remaining', 0.5)
+            ->assertJsonPath('recommended_total', 2)
+            ->assertJsonCount(1, 'groups.must_buy')
+            ->assertJsonCount(1, 'groups.optional')
+            ->assertJsonCount(1, 'groups.deferred')
+            ->assertJsonPath('groups.must_buy.0.name', 'Commander Card')
+            ->assertJsonPath('groups.optional.0.name', 'Sideboard Card')
+            ->assertJsonFragment([
+                'name' => 'Mainboard Card',
+                'priority' => 'must-buy',
+                'category' => 'mainboard',
+            ])
+            ->assertJsonFragment([
+                'name' => 'Sideboard Card',
+                'priority' => 'optional',
+                'category' => 'sideboard',
+            ]);
+    }
+
     public function test_it_updates_a_deck()
     {
         $deck = Deck::factory()->create(['user_id' => $this->user->id, 'name' => 'Old Name']);

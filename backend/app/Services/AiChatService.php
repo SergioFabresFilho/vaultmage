@@ -1903,6 +1903,11 @@ class AiChatService
             return ['error' => 'Change proposal rejected: no valid added_cards, removed_cards, or buy_cards were provided. Include at least one concrete card change and call propose_changes again.'];
         }
 
+        $budget = isset($args['budget']) && is_numeric($args['budget'])
+            ? round((float) $args['budget'], 2)
+            : null;
+        $buyList = $this->buildCanonicalBuyList($buy['cards'], $budget);
+
         return [
             'proposal' => [
                 'proposal_type'     => 'changes',
@@ -1913,6 +1918,7 @@ class AiChatService
                 'added_cards'       => $added['cards'],
                 'removed_cards'     => $removed['cards'],
                 'buy_cards'         => $buy['cards'],
+                'buy_list'          => $buyList,
             ],
         ];
     }
@@ -1934,6 +1940,8 @@ class AiChatService
             'cards' => $resolved->map(function ($item) use ($ownedMap) {
             $card = $item['card'];
             $entry = $item['entry'];
+            $quantity = max(1, (int) ($entry['quantity'] ?? 1));
+            $priceUsd = $card->price_usd !== null ? (float) $card->price_usd : null;
 
             return [
                 'card_id'        => $card->id,
@@ -1941,13 +1949,101 @@ class AiChatService
                 'type_line'      => $card->type_line,
                 'mana_cost'      => $card->mana_cost,
                 'image_uri'      => $card->image_uri,
-                'quantity'       => max(1, (int) ($entry['quantity'] ?? 1)),
+                'quantity'       => $quantity,
                 'owned_quantity' => (int) ($ownedMap[$card->id] ?? 0),
+                'price_usd'      => $priceUsd,
+                'line_total'     => $priceUsd !== null ? round($priceUsd * $quantity, 2) : null,
+                'priority'       => ($entry['priority'] ?? ($entry['role'] ?? '')) === 'optional' ? 'optional' : 'must-buy',
+                'category'       => $entry['category'] ?? null,
                 'role'           => $entry['role'] ?? null,
                 'reason'         => $entry['reason'] ?? null,
             ];
             })->values()->all(),
             'unresolved_names' => $resolution['unresolved_names'],
+        ];
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $items
+     * @return array<string, mixed>
+     */
+    private function buildCanonicalBuyList(array $items, ?float $budget): array
+    {
+        $collection = collect($items)->values()->map(function (array $item) {
+            $priority = ($item['priority'] ?? 'must-buy') === 'optional' ? 'optional' : 'must-buy';
+            $category = $item['category'] ?? (($item['role'] ?? '') === 'commander' ? 'commander' : null);
+
+            return [
+                ...$item,
+                'priority' => $priority,
+                'category' => $category,
+            ];
+        });
+
+        $mustBuy = $collection
+            ->filter(fn (array $item) => $item['priority'] === 'must-buy')
+            ->sortBy([
+                fn (array $item) => $item['line_total'] === null ? 1 : 0,
+                fn (array $item) => $item['line_total'] ?? PHP_FLOAT_MAX,
+            ])
+            ->values();
+
+        $optional = $collection
+            ->filter(fn (array $item) => $item['priority'] === 'optional')
+            ->sortBy([
+                fn (array $item) => $item['line_total'] === null ? 1 : 0,
+                fn (array $item) => $item['line_total'] ?? PHP_FLOAT_MAX,
+            ])
+            ->values();
+
+        $recommended = collect();
+        $remaining = $budget;
+
+        foreach ($mustBuy as $item) {
+            if ($remaining === null || $item['line_total'] === null) {
+                $recommended->push($item);
+                continue;
+            }
+
+            if ($item['line_total'] <= $remaining) {
+                $recommended->push($item);
+                $remaining = round($remaining - $item['line_total'], 2);
+            }
+        }
+
+        foreach ($optional as $item) {
+            if ($remaining === null) {
+                break;
+            }
+
+            if ($item['line_total'] === null) {
+                continue;
+            }
+
+            if ($item['line_total'] <= $remaining) {
+                $recommended->push($item);
+                $remaining = round($remaining - $item['line_total'], 2);
+            }
+        }
+
+        $recommendedIds = $recommended->pluck('card_id')->all();
+        $recommendedPriced = $recommended->filter(fn (array $item) => $item['line_total'] !== null);
+        $pricedItems = $collection->filter(fn (array $item) => $item['line_total'] !== null);
+
+        return [
+            'items' => $collection->all(),
+            'missing_cards_count' => $collection->sum('quantity'),
+            'estimated_total' => round((float) $pricedItems->sum('line_total'), 2),
+            'priced_items_count' => $pricedItems->count(),
+            'unpriced_items_count' => $collection->count() - $pricedItems->count(),
+            'budget' => $budget,
+            'budget_remaining' => $remaining,
+            'recommended_total' => round((float) $recommendedPriced->sum('line_total'), 2),
+            'groups' => [
+                'must_buy' => $recommended->filter(fn (array $item) => $item['priority'] === 'must-buy')->values()->all(),
+                'optional' => $recommended->filter(fn (array $item) => $item['priority'] === 'optional')->values()->all(),
+                'deferred' => $collection->filter(fn (array $item) => ! in_array($item['card_id'], $recommendedIds, true))->values()->all(),
+            ],
         ];
     }
 
@@ -2204,6 +2300,10 @@ class AiChatService
                                 'type'        => 'string',
                                 'description' => 'Short summary of what the upgrade is trying to improve.',
                             ],
+                            'budget' => [
+                                'type' => 'number',
+                                'description' => 'Optional buy budget cap in USD for the recommended cards.',
+                            ],
                             'added_cards' => [
                                 'type' => 'array',
                                 'items' => [
@@ -2225,6 +2325,8 @@ class AiChatService
                                     'properties' => [
                                         'card_name' => ['type' => 'string'],
                                         'quantity'  => ['type' => 'integer', 'minimum' => 1],
+                                        'priority'  => ['type' => 'string', 'enum' => ['must-buy', 'optional']],
+                                        'category'  => ['type' => 'string', 'enum' => ['commander', 'mainboard', 'sideboard', 'upgrade']],
                                         'role'      => ['type' => 'string'],
                                         'reason'    => ['type' => 'string'],
                                     ],

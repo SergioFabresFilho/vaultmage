@@ -732,6 +732,7 @@ class AiDeckBuilderTest extends TestCase
         $cut = $this->makeCard('Cancel', 'Instant', 0, priceUsd: 0.10);
         $keep = $this->makeCard('Island', 'Basic Land — Island', 10, priceUsd: 0.02);
         $add = $this->makeCard('Counterspell', 'Instant', 2, priceUsd: 1.50);
+        $buy = $this->makeCard('Mystic Confluence', 'Instant', 0, priceUsd: 3.00);
 
         $deck = Deck::factory()->create([
             'user_id' => $this->user->id,
@@ -749,11 +750,15 @@ class AiDeckBuilderTest extends TestCase
                     'deck_name' => 'Blue Control',
                     'format' => 'casual',
                     'strategy_summary' => 'Upgrade the interaction suite.',
+                    'budget' => 4.00,
                     'added_cards' => [
                         ['card_name' => 'Counterspell', 'quantity' => 2, 'role' => 'interaction'],
                     ],
                     'removed_cards' => [
                         ['card_name' => 'Cancel', 'quantity' => 2, 'role' => 'interaction'],
+                    ],
+                    'buy_cards' => [
+                        ['card_name' => 'Mystic Confluence', 'quantity' => 1, 'priority' => 'must-buy', 'category' => 'upgrade'],
                     ],
                 ], 'call_1'), 200)
                 ->push($this->textResponse('Swap Cancel for Counterspell.'), 200),
@@ -770,11 +775,17 @@ class AiDeckBuilderTest extends TestCase
         $this->assertEquals('changes', $proposal['proposal_type']);
         $this->assertCount(1, $proposal['added_cards']);
         $this->assertCount(1, $proposal['removed_cards']);
+        $this->assertCount(1, $proposal['buy_cards']);
         $this->assertNull($proposal['draft_deck_id'] ?? null);
         $this->assertEquals('Counterspell', $proposal['added_cards'][0]['name']);
         $this->assertEquals(2, $proposal['added_cards'][0]['quantity']);
         $this->assertEquals('Cancel', $proposal['removed_cards'][0]['name']);
         $this->assertEquals(2, $proposal['removed_cards'][0]['quantity']);
+        $this->assertEquals('Mystic Confluence', $proposal['buy_cards'][0]['name']);
+        $this->assertEquals(4.0, $proposal['buy_list']['budget']);
+        $this->assertEquals(3.0, $proposal['buy_list']['recommended_total']);
+        $this->assertCount(1, $proposal['buy_list']['groups']['must_buy']);
+        $this->assertEquals('Mystic Confluence', $proposal['buy_list']['groups']['must_buy'][0]['name']);
     }
 
     public function test_deck_upgrade_proposal_retries_when_change_cards_are_unresolved(): void
