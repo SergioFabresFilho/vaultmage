@@ -34,4 +34,23 @@ class CardImportCommandTest extends TestCase
             return $job->runId === $run->id;
         });
     }
+
+    public function test_import_command_rejects_new_run_when_another_import_is_active(): void
+    {
+        Queue::fake();
+
+        CardImportRun::create([
+            'bulk_type' => 'oracle_cards',
+            'chunk_size' => 500,
+            'dry_run' => false,
+            'status' => CardImportRun::STATUS_PROCESSING,
+            'started_at' => now(),
+        ]);
+
+        $this->artisan('cards:import-bulk')
+            ->assertFailed();
+
+        $this->assertSame(1, CardImportRun::count());
+        Queue::assertNothingPushed();
+    }
 }

@@ -4,6 +4,8 @@ namespace App\Jobs;
 
 use App\Models\CardImportRun;
 use App\Services\ScryfallBulkImportService;
+use Illuminate\Queue\Middleware\WithoutOverlapping;
+use Throwable;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -15,16 +17,46 @@ class RunScryfallBulkImport implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    public int $tries = 1;
-    public int $timeout = 1800;
+    public int $tries = 3;
+    public array $backoff = [60, 300, 900];
+    public int $timeout = 7200;
+    public bool $failOnTimeout = true;
 
     public function __construct(
         public readonly int $runId,
     ) {}
 
+    public function middleware(): array
+    {
+        return [
+            (new WithoutOverlapping('scryfall-bulk-import-orchestrator'))
+                ->releaseAfter(300)
+                ->expireAfter($this->timeout + 300),
+        ];
+    }
+
     public function handle(ScryfallBulkImportService $importer): void
     {
         $run = CardImportRun::findOrFail($this->runId);
+
+        Log::info('Scryfall bulk import orchestration picked up', [
+            'run_id' => $run->id,
+            'attempts' => $this->attempts(),
+            'bulk_type' => $run->bulk_type,
+            'chunk_size' => $run->chunk_size,
+            'dry_run' => $run->dry_run,
+            'queue' => $this->queue,
+        ]);
+
+        if (in_array($run->status, [CardImportRun::STATUS_COMPLETED, CardImportRun::STATUS_FAILED], true)) {
+            Log::warning('Scryfall bulk import orchestration skipped terminal run', [
+                'run_id' => $run->id,
+                'status' => $run->status,
+                'attempts' => $this->attempts(),
+            ]);
+
+            return;
+        }
 
         $run->update([
             'status' => CardImportRun::STATUS_DOWNLOADING,
@@ -40,7 +72,23 @@ class RunScryfallBulkImport implements ShouldQueue
             'dry_run' => $run->dry_run,
         ]);
 
-        $summary = $importer->dispatchChunks($run);
+        try {
+            $summary = $importer->dispatchChunks($run);
+        } catch (Throwable $exception) {
+            Log::error('Scryfall bulk import orchestration exception', [
+                'run_id' => $run->id,
+                'attempts' => $this->attempts(),
+                'exception_class' => $exception::class,
+                'message' => $exception->getMessage(),
+            ]);
+
+            if ($this->isNonRecoverable($exception)) {
+                $this->fail($exception);
+                return;
+            }
+
+            throw $exception;
+        }
 
         $run->refresh();
         $finalStatus = $summary['total_chunks'] === 0
@@ -70,7 +118,7 @@ class RunScryfallBulkImport implements ShouldQueue
         ]);
     }
 
-    public function failed(\Throwable $exception): void
+    public function failed(Throwable $exception): void
     {
         CardImportRun::whereKey($this->runId)->update([
             'status' => CardImportRun::STATUS_FAILED,
@@ -80,7 +128,18 @@ class RunScryfallBulkImport implements ShouldQueue
 
         Log::error('Scryfall bulk import failed during orchestration', [
             'run_id' => $this->runId,
+            'attempts' => $this->attempts(),
+            'exception_class' => $exception::class,
             'message' => $exception->getMessage(),
+            'trace' => mb_substr($exception->getTraceAsString(), 0, 4000),
         ]);
+    }
+
+    private function isNonRecoverable(Throwable $exception): bool
+    {
+        $message = $exception->getMessage();
+
+        return str_contains($message, 'Bulk data type [')
+            || str_contains($message, 'Unable to create a temporary file');
     }
 }

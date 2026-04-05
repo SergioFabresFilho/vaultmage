@@ -10,7 +10,11 @@ use App\Services\GoogleVisionClientAdapter;
 use Google\Cloud\Vision\V1\Client\ImageAnnotatorClient;
 use Illuminate\Auth\Notifications\ResetPassword;
 use Illuminate\Support\Facades\Gate;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\ServiceProvider;
+use Illuminate\Queue\Events\JobExceptionOccurred;
+use Illuminate\Queue\Events\JobFailed;
 
 class AppServiceProvider extends ServiceProvider
 {
@@ -69,6 +73,30 @@ class AppServiceProvider extends ServiceProvider
 
         ResetPassword::createUrlUsing(function (object $notifiable, string $token) {
             return config('app.frontend_url')."/password-reset/$token?email={$notifiable->getEmailForPasswordReset()}";
+        });
+
+        Queue::exceptionOccurred(function (JobExceptionOccurred $event): void {
+            Log::error('Queue job exception occurred', [
+                'job' => $event->job->resolveName(),
+                'connection' => $event->connectionName,
+                'queue' => $event->job->getQueue(),
+                'attempts' => $event->job->attempts(),
+                'exception_class' => $event->exception::class,
+                'message' => $event->exception->getMessage(),
+                'trace' => mb_substr($event->exception->getTraceAsString(), 0, 4000),
+            ]);
+        });
+
+        Queue::failing(function (JobFailed $event): void {
+            Log::error('Queue job failed', [
+                'job' => $event->job->resolveName(),
+                'connection' => $event->connectionName,
+                'queue' => $event->job->getQueue(),
+                'attempts' => $event->job->attempts(),
+                'exception_class' => $event->exception::class,
+                'message' => $event->exception->getMessage(),
+                'trace' => mb_substr($event->exception->getTraceAsString(), 0, 4000),
+            ]);
         });
     }
 }
