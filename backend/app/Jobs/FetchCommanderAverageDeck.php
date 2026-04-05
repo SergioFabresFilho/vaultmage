@@ -65,6 +65,15 @@ class FetchCommanderAverageDeck implements ShouldQueue
 
     public function handle(): void
     {
+        Log::info('FetchCommanderAverageDeck picked up by worker.', [
+            'commander' => $this->commanderName,
+            'commander_slug' => $this->commanderSlug,
+            'budget_tier' => $this->budgetTier,
+            'archetype' => $this->normalizedArchetype(),
+            'queue' => $this->queue,
+            'attempts' => $this->attempts(),
+        ]);
+
         // Polite rate limiting — keeps requests under ~3/sec even with multiple workers
         usleep(350_000);
 

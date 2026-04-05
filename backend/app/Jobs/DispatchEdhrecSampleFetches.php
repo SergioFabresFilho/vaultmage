@@ -33,6 +33,13 @@ class DispatchEdhrecSampleFetches implements ShouldQueue
     {
         $archetypes = $this->normalizedArchetypes();
 
+        Log::info('EDHREC sample backfill dispatcher picked up.', [
+            'budget_tier' => $this->budgetTier,
+            'archetypes' => $archetypes->all(),
+            'fresh' => $this->fresh,
+            'limit' => $this->limit,
+        ]);
+
         $query = Card::where(function ($q) {
                 $q->where('type_line', 'like', '%Legendary Creature%')
                     ->orWhere('type_line', 'like', '%Legendary%Planeswalker%')
@@ -73,8 +80,9 @@ class DispatchEdhrecSampleFetches implements ShouldQueue
         }
 
         $dispatched = 0;
+        $commanderCount = $commanders->count();
 
-        foreach ($commanders as $name) {
+        foreach ($commanders->values() as $index => $name) {
             $slug = $this->nameToSlug($name);
 
             foreach ($archetypes as $archetype) {
@@ -86,6 +94,16 @@ class DispatchEdhrecSampleFetches implements ShouldQueue
                 )->onQueue('edhrec');
 
                 $dispatched++;
+            }
+
+            if ((($index + 1) % 100) === 0 || ($index + 1) === $commanderCount) {
+                Log::info('EDHREC sample backfill dispatcher progress.', [
+                    'processed_commanders' => $index + 1,
+                    'total_commanders' => $commanderCount,
+                    'jobs_dispatched' => $dispatched,
+                    'budget_tier' => $this->budgetTier,
+                    'archetypes' => $archetypes->all(),
+                ]);
             }
         }
 
