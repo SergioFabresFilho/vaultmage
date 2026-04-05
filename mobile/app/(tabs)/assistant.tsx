@@ -47,6 +47,9 @@ type ProposalCard = {
   line_total?: number | null;
   priority?: string | null;
   category?: string | null;
+  reason_type?: string | null;
+  explanation_summary?: string | null;
+  budget_status?: 'included' | 'deferred_for_budget' | 'unpriced' | 'not_applicable' | null;
   role: string | null;
   reason: string | null;
 };
@@ -60,8 +63,16 @@ type ProposalBuyList = {
   budget: number | null;
   budget_remaining: number | null;
   recommended_total: number;
+  cheapest_completion: {
+    items: ProposalCard[];
+    missing_cards_count: number;
+    estimated_total: number;
+    priced_items_count: number;
+    unpriced_items_count: number;
+  };
   groups: {
     must_buy: ProposalCard[];
+    upgrade: ProposalCard[];
     optional: ProposalCard[];
     deferred: ProposalCard[];
   };
@@ -73,6 +84,9 @@ type DeckProposal = {
   format: string | null;
   strategy_summary: string | null;
   cards: ProposalCard[];
+  baseline_kept_cards?: ProposalCard[];
+  owned_replacement_cards?: ProposalCard[];
+  missing_cards_to_buy?: ProposalCard[];
   added_cards?: ProposalCard[];
   removed_cards?: ProposalCard[];
   buy_cards?: ProposalCard[];
@@ -110,20 +124,21 @@ type SearchableCard = {
 
 const BUILD_FORMAT_OPTIONS: BuilderOption[] = [
   { label: 'Commander', value: 'commander' },
-  { label: 'Brawl', value: 'brawl' },
-  { label: 'Modern', value: 'modern' },
-  { label: 'Standard', value: 'standard' },
-  { label: 'Pioneer', value: 'pioneer' },
-  { label: 'Casual', value: 'casual' },
 ];
 
-const BUILD_PLAYSTYLE_OPTIONS: BuilderOption[] = [
+const BUILD_ARCHETYPE_OPTIONS: BuilderOption[] = [
+  { label: 'Aristocrats', value: 'aristocrats' },
   { label: 'Aggro', value: 'aggro' },
-  { label: 'Midrange', value: 'midrange' },
+  { label: 'Tokens', value: 'tokens' },
+  { label: 'Spellslinger', value: 'spellslinger' },
+  { label: 'Reanimator', value: 'reanimator' },
+  { label: 'Blink', value: 'blink' },
+  { label: 'Sacrifice', value: 'sacrifice' },
+  { label: 'Ramp', value: 'ramp' },
   { label: 'Control', value: 'control' },
   { label: 'Combo', value: 'combo' },
-  { label: 'Ramp', value: 'ramp' },
-  { label: 'Tokens', value: 'tokens' },
+  { label: 'Midrange', value: 'midrange' },
+  { label: 'Custom', value: 'custom' },
 ];
 
 const BUILD_BUDGET_OPTIONS: BuilderOption[] = [
@@ -134,7 +149,7 @@ const BUILD_BUDGET_OPTIONS: BuilderOption[] = [
   { label: 'Custom', value: 'custom' },
 ];
 
-const COMMANDER_FORMATS = new Set(['commander', 'brawl']);
+const COMMANDER_FORMATS = new Set(['commander']);
 const BUILDER_COLOR_OPTIONS = ['W', 'U', 'B', 'R', 'G', 'C'] as const;
 type BuilderColor = typeof BUILDER_COLOR_OPTIONS[number];
 
@@ -202,10 +217,16 @@ function ProposalBubble({
   const addedCards = proposal.added_cards ?? [];
   const removedCards = proposal.removed_cards ?? [];
   const buyCards = proposal.buy_cards ?? [];
+  const baselineKeptCards = proposal.baseline_kept_cards ?? [];
+  const ownedReplacementCards = proposal.owned_replacement_cards ?? [];
+  const missingCardsToBuy = proposal.missing_cards_to_buy ?? [];
   const buyList = proposal.buy_list;
   const isChangeProposal = proposal.proposal_type === 'changes';
   const hasValidationIssues = Boolean(proposal.validation_message);
-  const hasDiffView = isChangeProposal || addedCards.length > 0 || removedCards.length > 0 || buyCards.length > 0;
+  const hasBuildBuckets = !isChangeProposal && (
+    baselineKeptCards.length > 0 || ownedReplacementCards.length > 0 || missingCardsToBuy.length > 0
+  );
+  const hasDiffView = isChangeProposal || hasBuildBuckets || addedCards.length > 0 || removedCards.length > 0 || buyCards.length > 0;
   const sortedCards = [...proposal.cards].sort((a, b) => {
     if (a.role === 'commander') return -1;
     if (b.role === 'commander') return 1;
@@ -213,7 +234,24 @@ function ProposalBubble({
   });
   const visibleCards = expanded ? sortedCards : sortedCards.slice(0, 6);
 
+  function buyListStatusLabel(card: ProposalCard): string | null {
+    if (card.budget_status === 'deferred_for_budget') return 'Deferred by budget';
+    if (card.budget_status === 'unpriced') return 'Missing price data';
+    if (card.priority === 'must-buy') return 'Required';
+    if (card.priority === 'upgrade') return 'Upgrade';
+    return null;
+  }
+
+  function buyListStatusStyle(card: ProposalCard) {
+    if (card.budget_status === 'deferred_for_budget') return styles.buyListStatusDeferred;
+    if (card.budget_status === 'unpriced') return styles.buyListStatusUnpriced;
+    if (card.priority === 'must-buy') return styles.buyListStatusRequired;
+    return styles.buyListStatusUpgrade;
+  }
+
   function renderCardRow(card: ProposalCard, kind: 'default' | 'added' | 'removed' = 'default') {
+    const explanation = card.explanation_summary ?? card.reason;
+
     return (
       <TouchableOpacity
         key={`${kind}-${card.card_id != null ? String(card.card_id) : card.name}`}
@@ -234,7 +272,12 @@ function ProposalBubble({
             {card.type_line ?? ''}
             {card.mana_cost ? `  ${card.mana_cost}` : ''}
           </Text>
-          {card.reason ? <Text style={styles.proposalCardReason}>{card.reason}</Text> : null}
+          {kind === 'added' && buyListStatusLabel(card) ? (
+            <View style={[styles.buyListStatusPill, buyListStatusStyle(card)]}>
+              <Text style={styles.buyListStatusText}>{buyListStatusLabel(card)}</Text>
+            </View>
+          ) : null}
+          {explanation ? <Text style={styles.proposalCardReason}>{explanation}</Text> : null}
         </View>
         <View style={styles.proposalCardRight}>
           <Text
@@ -275,6 +318,37 @@ function ProposalBubble({
 
       {hasDiffView ? (
         <>
+          {hasBuildBuckets ? (
+            <>
+              {baselineKeptCards.length > 0 ? (
+                <View style={styles.changeSection}>
+                  <View style={styles.changeSectionHeader}>
+                    <Ionicons name="layers" size={16} color="#fbbf24" />
+                    <Text style={styles.changeSectionTitle}>Kept From Baseline</Text>
+                  </View>
+                  {baselineKeptCards.map((card) => renderCardRow(card))}
+                </View>
+              ) : null}
+              {ownedReplacementCards.length > 0 ? (
+                <View style={styles.changeSection}>
+                  <View style={styles.changeSectionHeader}>
+                    <Ionicons name="swap-horizontal" size={16} color="#4ade80" />
+                    <Text style={styles.changeSectionTitle}>Owned Replacements Used</Text>
+                  </View>
+                  {ownedReplacementCards.map((card) => renderCardRow(card, 'added'))}
+                </View>
+              ) : null}
+              {missingCardsToBuy.length > 0 ? (
+                <View style={styles.changeSection}>
+                  <View style={styles.changeSectionHeader}>
+                    <Ionicons name="cart" size={16} color="#60a5fa" />
+                    <Text style={styles.changeSectionTitle}>Missing Cards To Buy</Text>
+                  </View>
+                  {missingCardsToBuy.map((card) => renderCardRow(card, 'added'))}
+                </View>
+              ) : null}
+            </>
+          ) : null}
           {addedCards.length > 0 ? (
             <View style={styles.changeSection}>
               <View style={styles.changeSectionHeader}>
@@ -310,11 +384,12 @@ function ProposalBubble({
               </View>
               <Text style={styles.buyListSummaryText}>
                 {buyList.missing_cards_count} missing cards · ${buyList.estimated_total.toFixed(2)} total
+                {buyList.cheapest_completion ? ` · $${buyList.cheapest_completion.estimated_total.toFixed(2)} to finish` : ''}
                 {buyList.budget != null ? ` · $${buyList.recommended_total.toFixed(2)} under $${buyList.budget.toFixed(2)}` : ''}
               </Text>
               {[
                 { key: 'must_buy', title: 'Must Buy', items: buyList.groups.must_buy },
-                { key: 'optional', title: 'Optional', items: buyList.groups.optional },
+                { key: 'upgrade', title: 'Upgrade', items: buyList.groups.upgrade },
                 { key: 'deferred', title: 'Deferred', items: buyList.groups.deferred },
               ].map((section) => (
                 section.items.length > 0 ? (
@@ -476,7 +551,8 @@ export default function AssistantScreen() {
   const [thinkingLabel, setThinkingLabel] = useState('VaultMage is thinking…');
   const [builderModalVisible, setBuilderModalVisible] = useState(false);
   const [builderFormat, setBuilderFormat] = useState(BUILD_FORMAT_OPTIONS[0].value);
-  const [builderPlaystyle, setBuilderPlaystyle] = useState(BUILD_PLAYSTYLE_OPTIONS[0].value);
+  const [builderArchetype, setBuilderArchetype] = useState(BUILD_ARCHETYPE_OPTIONS[0].value);
+  const [builderCustomArchetype, setBuilderCustomArchetype] = useState('');
   const [builderBudget, setBuilderBudget] = useState(BUILD_BUDGET_OPTIONS[0].value);
   const [builderCustomBudget, setBuilderCustomBudget] = useState('');
   const [builderColors, setBuilderColors] = useState<BuilderColor[]>(['U']);
@@ -780,6 +856,7 @@ export default function AssistantScreen() {
       const toolLabels: Record<string, string> = {
         get_collection:  'Checking your collection…',
         get_decks:       'Loading your decks…',
+        get_commander_guide: 'Loading commander baseline…',
         search_cards:    'Searching cards…',
         search_scryfall: 'Looking up Scryfall…',
         propose_changes: 'Preparing upgrade suggestions…',
@@ -873,19 +950,24 @@ export default function AssistantScreen() {
 
   function buildDeckPrompt() {
     const budget = builderBudget === 'custom' ? builderCustomBudget.trim() : builderBudget;
+    const archetype = builderArchetype === 'custom' ? builderCustomArchetype.trim() : builderArchetype;
     if (!budget) return null;
+    if (!archetype) return null;
 
     if (COMMANDER_FORMATS.has(builderFormat)) {
       if (!selectedCommander) return null;
 
       return [
-        'Build me a brand-new deck.',
-        `Format: ${titleCase(builderFormat)}.`,
+        'Build me a brand-new Commander deck.',
         `Commander: ${selectedCommander.name}.`,
-        `Search colors: [${(selectedCommander.color_identity?.length ? selectedCommander.color_identity : ['C']).join(', ')}].`,
-        `Playstyle: ${builderPlaystyle}.`,
+        `Archetype: ${archetype}.`,
         `Budget: ${budget}.`,
-        'These are the required deck-building details, so start building immediately and do not ask me to confirm them again.',
+        `Search colors: [${(selectedCommander.color_identity?.length ? selectedCommander.color_identity : ['C']).join(', ')}].`,
+        'Use a commander baseline for this commander and budget, then adapt it to this archetype.',
+        'Replace missing baseline cards only with cards I own that match the same slot by role, mana curve, and archetype synergy.',
+        'If no strong owned replacement exists, keep the baseline card as missing instead of weakening the deck theme.',
+        'Show the result in three buckets: cards kept from baseline, owned replacements used, and missing cards to buy.',
+        'These details are final, so start building immediately and do not ask me to confirm them again.',
         'Prioritize cards I already own when possible.',
       ].join(' ');
     }
@@ -901,7 +983,7 @@ export default function AssistantScreen() {
       `Format: ${titleCase(builderFormat)}.`,
       `Colors: ${colorNames}.`,
       `Search colors: [${builderColors.join(', ')}].`,
-      `Playstyle: ${builderPlaystyle}.`,
+      `Archetype: ${archetype}.`,
       `Budget: ${budget}.`,
       'These are the required deck-building details, so start building immediately and do not ask me to confirm them again.',
       'Prioritize cards I already own when possible.',
@@ -913,6 +995,8 @@ export default function AssistantScreen() {
     if (!prompt) {
       if (COMMANDER_FORMATS.has(builderFormat) && !selectedCommander) {
         Alert.alert('Commander needed', 'Search for and select a commander before building.');
+      } else if ((builderArchetype === 'custom' && !builderCustomArchetype.trim()) || !builderArchetype) {
+        Alert.alert('Archetype needed', 'Choose or enter an archetype before building.');
       } else if (builderColors.length === 0) {
         Alert.alert('Colors needed', 'Pick at least one color before building.');
       } else {
@@ -1078,7 +1162,7 @@ export default function AssistantScreen() {
             <Text style={styles.emptySubtitle}>
               {params.deckName
                 ? `Start a chat about ${params.deckName}. VaultMage will use that deck and your collection.`
-                : 'Tell VaultMage what kind of deck you want to build. It knows your collection.'}
+                : 'Build a Commander deck by choosing a commander, archetype, and budget. VaultMage will use your collection first.'}
             </Text>
             <TouchableOpacity style={styles.primaryCta} onPress={() => startNewConversation()}>
               <Text style={styles.primaryCtaText}>Start Building</Text>
@@ -1188,12 +1272,12 @@ export default function AssistantScreen() {
               <Text style={styles.emptyChatText}>
                 {activeConversation.deck
                   ? `Ask how to improve ${activeConversation.deck.name}, what to swap from your collection, or what to buy next.`
-                  : "Tell me what kind of deck you want to build. I'll check your collection and craft something great."}
+                  : "Build a Commander deck from a commander, archetype, and budget. I'll start from a baseline, then adapt it to your collection."}
               </Text>
               {!activeConversation.deck ? (
                 <TouchableOpacity style={styles.builderLaunchBtn} onPress={() => setBuilderModalVisible(true)}>
                   <Ionicons name="options-outline" size={16} color="#fff" />
-                  <Text style={styles.builderLaunchBtnText}>Use deck builder brief</Text>
+                  <Text style={styles.builderLaunchBtnText}>Use Commander builder</Text>
                 </TouchableOpacity>
               ) : null}
             </View>
@@ -1322,7 +1406,7 @@ export default function AssistantScreen() {
               showsVerticalScrollIndicator={false}
             >
               <Text style={styles.builderIntroText}>
-                Pick the three things VaultMage always needs before it starts building.
+                Pick the commander, archetype, and budget before VaultMage starts building.
               </Text>
 
               <View style={styles.builderSection}>
@@ -1345,18 +1429,18 @@ export default function AssistantScreen() {
               </View>
 
               <View style={styles.builderSection}>
-                <Text style={styles.builderSectionLabel}>Playstyle</Text>
+                <Text style={styles.builderSectionLabel}>Archetype</Text>
                 <View style={styles.builderChipWrap}>
-                  {BUILD_PLAYSTYLE_OPTIONS.map((option) => (
+                  {BUILD_ARCHETYPE_OPTIONS.map((option) => (
                     <TouchableOpacity
                       key={option.value}
-                      style={[styles.builderChip, builderPlaystyle === option.value && styles.builderChipActive]}
-                      onPress={() => setBuilderPlaystyle(option.value)}
+                      style={[styles.builderChip, builderArchetype === option.value && styles.builderChipActive]}
+                      onPress={() => setBuilderArchetype(option.value)}
                     >
                       <Text
                         style={[
                           styles.builderChipText,
-                          builderPlaystyle === option.value && styles.builderChipTextActive,
+                          builderArchetype === option.value && styles.builderChipTextActive,
                         ]}
                       >
                         {option.label}
@@ -1364,6 +1448,21 @@ export default function AssistantScreen() {
                     </TouchableOpacity>
                   ))}
                 </View>
+                {builderArchetype === 'custom' ? (
+                  <TextInput
+                    style={styles.builderBudgetInput}
+                    placeholder='Example: lifegain, enchantress, artifacts'
+                    placeholderTextColor="#666"
+                    value={builderCustomArchetype}
+                    onChangeText={setBuilderCustomArchetype}
+                    maxLength={80}
+                    autoCorrect={false}
+                    autoCapitalize="words"
+                  />
+                ) : null}
+                <Text style={styles.builderHintText}>
+                  Use the deck's real theme, like aristocrats or spellslinger, not a vague power description.
+                </Text>
               </View>
 
               {COMMANDER_FORMATS.has(builderFormat) ? (
@@ -1371,7 +1470,7 @@ export default function AssistantScreen() {
                   <Text style={styles.builderSectionLabel}>Commander</Text>
                   <TextInput
                     style={styles.builderBudgetInput}
-                    placeholder={builderFormat === 'brawl' ? 'Search for a commander' : 'Search for a commander'}
+                    placeholder='Search for a commander'
                     placeholderTextColor="#666"
                     value={commanderQuery}
                     onChangeText={setCommanderQuery}
@@ -1499,6 +1598,8 @@ export default function AssistantScreen() {
                   {buildDeckPrompt() ?? (
                     COMMANDER_FORMATS.has(builderFormat) && !selectedCommander
                       ? 'Choose a commander to generate the request.'
+                      : (builderArchetype === 'custom' && !builderCustomArchetype.trim()) || !builderArchetype
+                        ? 'Choose an archetype to generate the request.'
                       : builderColors.length === 0
                         ? 'Pick at least one color to generate the request.'
                         : 'Choose a budget to generate the request.'
@@ -2025,6 +2126,31 @@ const styles = StyleSheet.create({
     letterSpacing: 0.4,
     marginBottom: 4,
   },
+  buyListStatusPill: {
+    alignSelf: 'flex-start',
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    marginBottom: 4,
+    borderWidth: 1,
+  },
+  buyListStatusRequired: {
+    backgroundColor: 'rgba(74, 222, 128, 0.12)',
+    borderColor: 'rgba(74, 222, 128, 0.35)',
+  },
+  buyListStatusUpgrade: {
+    backgroundColor: 'rgba(96, 165, 250, 0.14)',
+    borderColor: 'rgba(96, 165, 250, 0.3)',
+  },
+  buyListStatusDeferred: {
+    backgroundColor: 'rgba(248, 113, 113, 0.12)',
+    borderColor: 'rgba(248, 113, 113, 0.3)',
+  },
+  buyListStatusUnpriced: {
+    backgroundColor: 'rgba(251, 191, 36, 0.12)',
+    borderColor: 'rgba(251, 191, 36, 0.3)',
+  },
+  buyListStatusText: { color: '#e8eefb', fontSize: 10, fontWeight: '800', textTransform: 'uppercase' },
   proposalCardRow: {
     flexDirection: 'row',
     alignItems: 'flex-start',

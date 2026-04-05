@@ -24,7 +24,7 @@ class AiChatService
     private string $apiKey;
     private string $model;
 
-    public function __construct()
+    public function __construct(private BuyListFormatter $buyListFormatter)
     {
         $this->apiKey = config('services.openai.api_key', '');
         $this->model  = config('services.openai.model', 'gpt-4.1-mini');
@@ -1374,6 +1374,8 @@ class AiChatService
         if ($commanderName === '') {
             return ['error' => 'commander_name is required'];
         }
+        $archetype = trim((string) ($args['archetype'] ?? ''));
+        $archetype = $archetype !== '' ? $archetype : null;
 
         $validTiers = ['budget', 'average', 'expensive'];
         $budgetTier = in_array($args['budget_tier'] ?? '', $validTiers, true)
@@ -1431,6 +1433,7 @@ class AiChatService
             return [
                 'found'       => false,
                 'budget_tier' => $budgetTier,
+                'requested_archetype' => $archetype,
                 'message'     => "No EDHREC deck found for commander \"{$commanderName}\". Build from your own knowledge of this commander.",
                 'commander'   => $commanderCard ? [
                     'name'           => $commanderCard->name,
@@ -1466,6 +1469,7 @@ class AiChatService
             'found'          => true,
             'commander_name' => $sample->commander_name,
             'budget_tier'    => $sample->budget_tier,
+            'requested_archetype' => $archetype,
             'commander'      => $commanderCard ? [
                 'name'           => $commanderCard->name,
                 'type_line'      => $commanderCard->type_line,
@@ -1474,6 +1478,9 @@ class AiChatService
                 'oracle_text'    => $commanderCard->oracle_text ? mb_substr($commanderCard->oracle_text, 0, 200) : null,
             ] : null,
             'source'         => 'EDHREC ' . $sample->budget_tier . ' deck (human-curated)',
+            'archetype_note' => $archetype
+                ? "Use this as a {$archetype} baseline shell. Preserve the theme when choosing owned-card substitutions."
+                : null,
             'fetched_at'     => $sample->fetched_at?->toDateString(),
             'total_cards'    => $sampleCards->sum('quantity'),
             'cards'          => $enrichedCards,
@@ -1630,6 +1637,7 @@ class AiChatService
 
         $req = $formatRequirements[$format] ?? null;
         if ($req) {
+            $commanderColors = [];
             if (in_array($format, ['commander', 'edh', 'brawl'], true)) {
                 $commanderCards = array_values(array_filter(
                     $cards,
@@ -1707,6 +1715,28 @@ class AiChatService
                         ]);
                         $draftCandidate['validation_message'] = $error;
                         return ['error' => $error, 'draft_candidate' => $draftCandidate];
+                    }
+                }
+            }
+
+            if (isset($req['exact']) && $totalCards !== $req['exact']) {
+                if (
+                    in_array($format, ['commander', 'edh'], true)
+                    && $req['exact'] - $totalCards === 1
+                    && $totalCards === 99
+                ) {
+                    $autoCompleted = $this->autoCompleteCommanderSingleCardShortage(
+                        $cards,
+                        $commanderColors,
+                        $req['max_lands'] ?? 40,
+                        $req['max_basic_single'] ?? 25,
+                        $scryfall
+                    );
+
+                    if ($autoCompleted !== null) {
+                        $cards = $autoCompleted;
+                        $totalCards = array_sum(array_column($cards, 'quantity'));
+                        $draftCandidate['cards'] = $cards;
                     }
                 }
             }
@@ -1862,6 +1892,7 @@ class AiChatService
         ]);
 
         $changes = $this->buildProposalChanges($conversation, $cards, $user);
+        $buildBuckets = $this->buildDeckProposalBuckets($args, $cards, $user);
 
         return [
             'proposal' => [
@@ -1872,9 +1903,134 @@ class AiChatService
                 'cards'            => $cards,
                 'added_cards'      => $changes['added_cards'],
                 'removed_cards'    => $changes['removed_cards'],
+                'baseline_kept_cards' => $buildBuckets['baseline_kept_cards'],
+                'owned_replacement_cards' => $buildBuckets['owned_replacement_cards'],
+                'missing_cards_to_buy' => $buildBuckets['missing_cards_to_buy'],
                 'draft_deck_id'    => $draft->id,
             ],
         ];
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $cards
+     * @param  array<int, string>  $commanderColors
+     * @return array<int, array<string, mixed>>|null
+     */
+    private function autoCompleteCommanderSingleCardShortage(
+        array $cards,
+        array $commanderColors,
+        int $maxLands,
+        int $maxBasicSingle,
+        ScryfallService $scryfall
+    ): ?array {
+        $landCount = 0;
+        $basicCounts = [];
+        $basicOptions = $this->basicLandCandidatesForColors($commanderColors);
+
+        foreach ($cards as $card) {
+            if (str_contains((string) ($card['type_line'] ?? ''), 'Land')) {
+                $landCount += (int) ($card['quantity'] ?? 0);
+            }
+
+            if (in_array($card['name'], $basicOptions, true)) {
+                $basicCounts[$card['name']] = (int) ($card['quantity'] ?? 0);
+            }
+        }
+
+        if ($landCount >= $maxLands || $basicOptions === []) {
+            return null;
+        }
+
+        usort($basicOptions, function (string $left, string $right) use ($basicCounts): int {
+            return ($basicCounts[$left] ?? 0) <=> ($basicCounts[$right] ?? 0);
+        });
+
+        $chosenBasic = null;
+        foreach ($basicOptions as $candidate) {
+            if (($basicCounts[$candidate] ?? 0) < $maxBasicSingle) {
+                $chosenBasic = $candidate;
+                break;
+            }
+        }
+
+        if ($chosenBasic === null) {
+            return null;
+        }
+
+        foreach ($cards as &$card) {
+            if (($card['name'] ?? null) === $chosenBasic) {
+                $card['quantity'] = ((int) ($card['quantity'] ?? 0)) + 1;
+                $card['reason'] = $card['reason'] ?? 'Auto-completed to reach 100 cards.';
+                return $cards;
+            }
+        }
+        unset($card);
+
+        $basicCard = Card::whereRaw('LOWER(name) = ?', [strtolower($chosenBasic)])->first();
+
+        if (! $basicCard) {
+            try {
+                $data = $scryfall->findCard($chosenBasic);
+                $basicCard = Card::updateOrCreate(
+                    ['scryfall_id' => $data['scryfall_id']],
+                    $data
+                );
+            } catch (\Throwable $e) {
+                Log::warning('AiChatService: could not auto-complete 99-card commander deck with basic land', [
+                    'basic_land' => $chosenBasic,
+                    'error' => $e->getMessage(),
+                ]);
+                return null;
+            }
+        }
+
+        $cards[] = [
+            'card_id' => $basicCard->id,
+            'name' => $basicCard->name,
+            'type_line' => $basicCard->type_line,
+            'mana_cost' => $basicCard->mana_cost,
+            'color_identity' => $basicCard->color_identity,
+            'image_uri' => $basicCard->image_uri,
+            'quantity' => 1,
+            'owned_quantity' => 0,
+            'role' => 'land',
+            'reason' => 'Auto-completed to reach 100 cards.',
+        ];
+
+        Log::info('AiChatService: auto-completed 99-card commander deck', [
+            'basic_land' => $basicCard->name,
+        ]);
+
+        return $cards;
+    }
+
+    /**
+     * @param  array<int, string>  $colors
+     * @return array<int, string>
+     */
+    private function basicLandCandidatesForColors(array $colors): array
+    {
+        $map = [
+            'W' => 'Plains',
+            'U' => 'Island',
+            'B' => 'Swamp',
+            'R' => 'Mountain',
+            'G' => 'Forest',
+        ];
+
+        $candidates = [];
+        foreach ($colors as $color) {
+            $land = $map[strtoupper($color)] ?? null;
+            if ($land !== null) {
+                $candidates[] = $land;
+            }
+        }
+
+        if ($candidates === []) {
+            return ['Wastes'];
+        }
+
+        return array_values(array_unique($candidates));
     }
 
     private function toolProposeChanges(array $args, User $user, Conversation $conversation): array
@@ -1906,7 +2062,7 @@ class AiChatService
         $budget = isset($args['budget']) && is_numeric($args['budget'])
             ? round((float) $args['budget'], 2)
             : null;
-        $buyList = $this->buildCanonicalBuyList($buy['cards'], $budget);
+        $buyList = $this->buyListFormatter->build($buy['cards'], $budget);
 
         return [
             'proposal' => [
@@ -1953,97 +2109,14 @@ class AiChatService
                 'owned_quantity' => (int) ($ownedMap[$card->id] ?? 0),
                 'price_usd'      => $priceUsd,
                 'line_total'     => $priceUsd !== null ? round($priceUsd * $quantity, 2) : null,
-                'priority'       => ($entry['priority'] ?? ($entry['role'] ?? '')) === 'optional' ? 'optional' : 'must-buy',
+                'priority'       => in_array(($entry['priority'] ?? ($entry['role'] ?? '')), ['optional', 'upgrade'], true) ? 'upgrade' : 'must-buy',
                 'category'       => $entry['category'] ?? null,
                 'role'           => $entry['role'] ?? null,
                 'reason'         => $entry['reason'] ?? null,
+                'reason_type'    => $entry['reason_type'] ?? null,
             ];
             })->values()->all(),
             'unresolved_names' => $resolution['unresolved_names'],
-        ];
-    }
-
-    /**
-     * @param  array<int, array<string, mixed>>  $items
-     * @return array<string, mixed>
-     */
-    private function buildCanonicalBuyList(array $items, ?float $budget): array
-    {
-        $collection = collect($items)->values()->map(function (array $item) {
-            $priority = ($item['priority'] ?? 'must-buy') === 'optional' ? 'optional' : 'must-buy';
-            $category = $item['category'] ?? (($item['role'] ?? '') === 'commander' ? 'commander' : null);
-
-            return [
-                ...$item,
-                'priority' => $priority,
-                'category' => $category,
-            ];
-        });
-
-        $mustBuy = $collection
-            ->filter(fn (array $item) => $item['priority'] === 'must-buy')
-            ->sortBy([
-                fn (array $item) => $item['line_total'] === null ? 1 : 0,
-                fn (array $item) => $item['line_total'] ?? PHP_FLOAT_MAX,
-            ])
-            ->values();
-
-        $optional = $collection
-            ->filter(fn (array $item) => $item['priority'] === 'optional')
-            ->sortBy([
-                fn (array $item) => $item['line_total'] === null ? 1 : 0,
-                fn (array $item) => $item['line_total'] ?? PHP_FLOAT_MAX,
-            ])
-            ->values();
-
-        $recommended = collect();
-        $remaining = $budget;
-
-        foreach ($mustBuy as $item) {
-            if ($remaining === null || $item['line_total'] === null) {
-                $recommended->push($item);
-                continue;
-            }
-
-            if ($item['line_total'] <= $remaining) {
-                $recommended->push($item);
-                $remaining = round($remaining - $item['line_total'], 2);
-            }
-        }
-
-        foreach ($optional as $item) {
-            if ($remaining === null) {
-                break;
-            }
-
-            if ($item['line_total'] === null) {
-                continue;
-            }
-
-            if ($item['line_total'] <= $remaining) {
-                $recommended->push($item);
-                $remaining = round($remaining - $item['line_total'], 2);
-            }
-        }
-
-        $recommendedIds = $recommended->pluck('card_id')->all();
-        $recommendedPriced = $recommended->filter(fn (array $item) => $item['line_total'] !== null);
-        $pricedItems = $collection->filter(fn (array $item) => $item['line_total'] !== null);
-
-        return [
-            'items' => $collection->all(),
-            'missing_cards_count' => $collection->sum('quantity'),
-            'estimated_total' => round((float) $pricedItems->sum('line_total'), 2),
-            'priced_items_count' => $pricedItems->count(),
-            'unpriced_items_count' => $collection->count() - $pricedItems->count(),
-            'budget' => $budget,
-            'budget_remaining' => $remaining,
-            'recommended_total' => round((float) $recommendedPriced->sum('line_total'), 2),
-            'groups' => [
-                'must_buy' => $recommended->filter(fn (array $item) => $item['priority'] === 'must-buy')->values()->all(),
-                'optional' => $recommended->filter(fn (array $item) => $item['priority'] === 'optional')->values()->all(),
-                'deferred' => $collection->filter(fn (array $item) => ! in_array($item['card_id'], $recommendedIds, true))->values()->all(),
-            ],
         ];
     }
 
@@ -2166,6 +2239,81 @@ class AiChatService
         ];
     }
 
+    private function buildDeckProposalBuckets(array $args, array $finalCards, User $user): array
+    {
+        $baselineKept = $this->resolveFinalDeckSubset($args['baseline_kept_cards'] ?? [], $finalCards, $user);
+        $ownedReplacements = $this->resolveFinalDeckSubset($args['owned_replacement_cards'] ?? [], $finalCards, $user, true);
+
+        $missingCardsToBuy = collect($finalCards)
+            ->filter(fn (array $card) => (int) ($card['owned_quantity'] ?? 0) <= 0)
+            ->map(function (array $card) {
+                return [
+                    ...$card,
+                    'price_usd' => $this->normalizePrice($card['card_id'] ?? null),
+                    'line_total' => $this->normalizeLineTotal($card['card_id'] ?? null, (int) ($card['quantity'] ?? 1)),
+                ];
+            })
+            ->values()
+            ->all();
+
+        return [
+            'baseline_kept_cards' => $baselineKept,
+            'owned_replacement_cards' => $ownedReplacements,
+            'missing_cards_to_buy' => $missingCardsToBuy,
+        ];
+    }
+
+    private function resolveFinalDeckSubset(array $entries, array $finalCards, User $user, bool $requireOwned = false): array
+    {
+        if ($entries === []) {
+            return [];
+        }
+
+        $resolved = $this->resolveChangeEntries($entries, $user);
+        $finalCardMap = collect($finalCards)->keyBy('card_id');
+
+        return collect($resolved['cards'])
+            ->filter(function (array $card) use ($finalCardMap, $requireOwned) {
+                $final = $finalCardMap->get($card['card_id']);
+                if (! $final) {
+                    return false;
+                }
+
+                if ($requireOwned && (int) ($final['owned_quantity'] ?? 0) <= 0) {
+                    return false;
+                }
+
+                return true;
+            })
+            ->map(function (array $card) use ($finalCardMap) {
+                $final = $finalCardMap->get($card['card_id']);
+                return [
+                    ...$final,
+                    'reason' => $card['reason'] ?? ($final['reason'] ?? null),
+                    'price_usd' => $card['price_usd'] ?? $this->normalizePrice($card['card_id'] ?? null),
+                    'line_total' => $card['line_total'] ?? $this->normalizeLineTotal($card['card_id'] ?? null, (int) ($final['quantity'] ?? 1)),
+                ];
+            })
+            ->values()
+            ->all();
+    }
+
+    private function normalizePrice(?int $cardId): ?float
+    {
+        if ($cardId === null) {
+            return null;
+        }
+
+        $card = Card::find($cardId);
+        return $card?->price_usd !== null ? (float) $card->price_usd : null;
+    }
+
+    private function normalizeLineTotal(?int $cardId, int $quantity): ?float
+    {
+        $price = $this->normalizePrice($cardId);
+        return $price !== null ? round($price * max(1, $quantity), 2) : null;
+    }
+
     // -------------------------------------------------------------------------
     // Tool definitions (OpenAI function schema)
     // -------------------------------------------------------------------------
@@ -2209,7 +2357,7 @@ class AiChatService
                 'type'     => 'function',
                 'function' => [
                     'name'        => 'get_active_deck',
-                    'description' => 'Get the full card list for the deck attached to this conversation, including owned quantities and missing quantities. Use this when the user asks to improve, tune, upgrade, or budget-plan an existing deck.',
+                    'description' => 'Get the full card list for the deck attached to this conversation, including owned quantities, missing quantities, and card prices. Use this when the user asks to improve, tune, upgrade, finish, or cheapest-complete an existing deck.',
                     'parameters'  => [
                         'type'       => 'object',
                         'properties' => (object) [],
@@ -2262,7 +2410,7 @@ class AiChatService
                 'type'     => 'function',
                 'function' => [
                     'name'        => 'get_commander_guide',
-                    'description' => 'Look up an EDHREC deck for a specific Commander. Returns the card list that human players most commonly include. Pass budget_tier to get a price-appropriate baseline: "budget" (<$50), "average" ($50–$300), "expensive" (>$300 / no limit).',
+                    'description' => 'Look up an EDHREC deck for a specific Commander. Returns the card list that human players most commonly include. Pass budget_tier to get a price-appropriate baseline: "budget" (<$50), "average" ($50–$300), "expensive" (>$300 / no limit). Pass archetype when the user specifies a theme such as aristocrats, aggro, tokens, spellslinger, or blink so the returned baseline can be interpreted through that lens even if the cached source is generic.',
                     'parameters'  => [
                         'type'       => 'object',
                         'properties' => [
@@ -2275,6 +2423,10 @@ class AiChatService
                                 'enum'        => ['budget', 'average', 'expensive'],
                                 'description' => 'Price tier for the EDHREC deck. "budget" for decks under ~$50, "expensive" for decks over ~$300 or no budget limit, "average" otherwise.',
                             ],
+                            'archetype' => [
+                                'type'        => 'string',
+                                'description' => 'Optional strategy tag for the build, such as aristocrats, aggro, tokens, spellslinger, sacrifice, reanimator, or blink.',
+                            ],
                         ],
                         'required' => ['commander_name'],
                     ],
@@ -2284,7 +2436,7 @@ class AiChatService
                 'type'     => 'function',
                 'function' => [
                     'name'        => 'propose_changes',
-                    'description' => 'Present upgrade recommendations for an existing attached deck. Use this for deck tuning, swap suggestions, and buy recommendations instead of rebuilding the full deck.',
+                    'description' => 'Present upgrade recommendations for an existing attached deck. Use this for deck tuning, swap suggestions, buy recommendations, and cheapest-completion plans instead of rebuilding the full deck. It is valid to submit only buy_cards when the user wants to finish the current deck as cheaply as possible.',
                     'parameters'  => [
                         'type'       => 'object',
                         'properties' => [
@@ -2392,6 +2544,34 @@ class AiChatService
                                 ],
                                 'description' => 'Complete card list for the deck.',
                             ],
+                            'baseline_kept_cards' => [
+                                'type' => 'array',
+                                'items' => [
+                                    'type' => 'object',
+                                    'properties' => [
+                                        'card_name' => ['type' => 'string'],
+                                        'quantity' => ['type' => 'integer', 'minimum' => 1],
+                                        'role' => ['type' => 'string'],
+                                        'reason' => ['type' => 'string'],
+                                    ],
+                                    'required' => ['card_name'],
+                                ],
+                                'description' => 'Optional subset of final deck cards that stayed in the list from the commander baseline without being replaced.',
+                            ],
+                            'owned_replacement_cards' => [
+                                'type' => 'array',
+                                'items' => [
+                                    'type' => 'object',
+                                    'properties' => [
+                                        'card_name' => ['type' => 'string'],
+                                        'quantity' => ['type' => 'integer', 'minimum' => 1],
+                                        'role' => ['type' => 'string'],
+                                        'reason' => ['type' => 'string'],
+                                    ],
+                                    'required' => ['card_name'],
+                                ],
+                                'description' => 'Optional subset of final deck cards that were chosen as owned replacements for baseline cards.',
+                            ],
                         ],
                         'required' => ['deck_name', 'format', 'cards'],
                     ],
@@ -2419,18 +2599,20 @@ NEW DECK BUILDS — COMMANDER ONLY
 
 New deck builds are Commander / EDH only. If the user asks for another format, politely explain that new builds are Commander-only for now and ask for a commander name.
 
-To start a new Commander build you need exactly two things:
+To start a new Commander build you need:
 1. Commander name
 2. Budget (e.g. "under $50", "no limit", "only cards I own")
-If either is missing, ask for both in one message.
+3. Archetype / playstyle when the user has one (e.g. aristocrats, aggro, tokens, spellslinger)
+If commander or budget is missing, ask for both in one message. If the user has not given an archetype, ask for one unless they clearly want a generic best-version build.
 
 BUILD WORKFLOW — follow these steps in order, every time:
 
-Step 1 — call get_commander_guide with the commander name AND the correct budget_tier:
+Step 1 — call get_commander_guide with the commander name, the correct budget_tier, and the user's archetype if they gave one:
   - budget  → user budget is under ~$50
   - average → user budget is roughly $50–$300 (default if no budget stated)
   - expensive → user budget is over ~$300 or "no limit"
   This returns an EDHREC deck tuned for that price range: a human-curated 100-card baseline that is already color-legal and properly structured.
+  If the archetype is not explicitly encoded in the source, still use the requested archetype as a hard deck-building constraint for substitutions and final card choices.
   If EDHREC data is not found for that tier, the tool falls back to the average tier automatically.
 
 Step 2 — call get_collection (filtered to the commander's colors and "commander" format).
@@ -2439,16 +2621,25 @@ Step 2 — call get_collection (filtered to the commander's colors and "commande
 Step 3 — build the final 100-card list:
 
   ── PATH A: EDHREC baseline available ──
-  a. START with every card in the EDHREC list (it is already 100 cards including the commander).
+  a. START with every card in the EDHREC list (it is already 100 cards including the commander). Treat it as the target shell, not as untouchable truth.
   b. For each EDHREC card the user OWNS: keep it as-is.
   c. For each EDHREC card the user does NOT own:
-       - First try to substitute with an owned card that serves the same role.
+       - First try to substitute with an owned card that serves the same slot.
+       - A valid slot match means all of these are close: deck role, mana value / curve position, and synergy with the requested archetype.
+       - Prefer archetype-consistent substitutions over generic "goodstuff" cards.
+       - Example: in aristocrats, replace Blood Artist with Zulaport Cutthroat or Bastion of Remembrance before using a random black staple.
        - If no suitable owned substitute: keep the original card (the user will buy it).
        - Only search for cheaper alternatives if the user gave an explicit budget AND the card exceeds it.
   d. After substitutions the deck is still 100 cards. Do not pad with lands.
+  e. The final deck should preserve the requested archetype. If too many substitutions would dilute the theme, keep more missing baseline cards and surface them as buy recommendations instead of weakening the deck.
+  f. Track three explicit buckets while building:
+       - baseline_kept_cards: cards still in the final deck from the original baseline
+       - owned_replacement_cards: owned cards used instead of baseline cards
+       - missing_cards_to_buy: final-deck cards with owned_quantity = 0
+     The first two buckets should be submitted in propose_deck. The buy bucket is derived server-side from the final resolved deck.
 
   ── PATH B: No EDHREC data ──
-  Build a full 100-card list from your own knowledge using this exact structure:
+  Build a full 100-card list from your own knowledge using this exact structure, biased heavily toward the requested archetype:
     1  commander (with role "commander")
    10  ramp cards (Sol Ring, Arcane Signet, Mind Stone, Fellwar Stone, Thought Vessel, Worn Powerstone, Hedron Archive, Gilded Lotus, Thran Dynamo, Commander's Sphere, …)
    10  card draw spells (Rhystic Study, Mystic Remora, Phyrexian Arena, Necropotence, Read the Bones, Sign in Blood, Night's Whisper, Painful Truths, Thorough Investigation, Wheels, …)
@@ -2467,6 +2658,11 @@ Step 4 — call propose_deck with the complete 100-card list.
   - Set color_identity to the commander's color identity.
   - Set format to "commander".
   - Include the commander card with role "commander".
+  - In strategy_summary, explicitly mention the archetype and whether the list is generic baseline, collection-adapted, or collection-first.
+  - When you used a commander baseline, also pass:
+      - baseline_kept_cards
+      - owned_replacement_cards
+    These should be subsets of the final 100-card list and should use exact printed card names.
 
 IMPORTANT — tool economy:
 - get_collection once, get_commander_guide once. Then go straight to Step 3.
@@ -2503,7 +2699,10 @@ Repair (when propose_deck returns a count error):
 Budget:
 - price_usd is included on every card. Track the running buy total as you select unowned cards.
 - Cards the user owns cost $0. Cards with null price_usd are treated as $0.
-- Never exceed the stated budget on bought cards.
+- If the user says "only cards I own", treat that as a hard cap of $0 and maximize coherence within the archetype using collection cards only.
+- Treat the user's budget as a target, not a hard cap.
+- A small overshoot is acceptable if it keeps the deck coherent or avoids a major downgrade.
+- As a rule, keep bought cards within the smaller of $15 or 10% over the stated budget unless the user asked for a stricter cap.
 
 ═══════════════════════════════════════
 IMPROVING AN EXISTING DECK
@@ -2514,6 +2713,12 @@ IMPROVING AN EXISTING DECK
 - Prefer propose_changes for tuning, swaps, and buy recommendations. Only use propose_deck if the user explicitly asks for a full rebuild.
 - When improving, clearly separate: (1) cuts, (2) owned cards to swap in, (3) cards worth buying.
 - When the user asks what to buy, prioritize what they don't own and offer cheaper alternatives.
+- When the user asks to "finish this deck", "complete this deck", or "finish this deck as cheaply as possible":
+  - Keep the current deck list fixed unless the user explicitly asks for upgrades or swaps.
+  - Call get_active_deck and use the missing quantities already returned there.
+  - Call propose_changes with buy_cards for the exact missing cards needed to complete the deck.
+  - Do not add optional upgrades in that flow unless the user asks for them.
+  - Optimize for the lowest completion cost first; if some cards are unpriced, say that the total is only a partial estimate.
 
 ═══════════════════════════════════════
 GENERAL

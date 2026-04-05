@@ -9,6 +9,7 @@ use App\Models\Message;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Http\Client\Request;
 use Tests\TestCase;
 
 class AiDeckBuilderTest extends TestCase
@@ -290,6 +291,71 @@ class AiDeckBuilderTest extends TestCase
         $this->assertEquals(1.50, $card['price_usd']);
     }
 
+    public function test_new_deck_build_prompt_treats_budget_as_soft_target(): void
+    {
+        Http::fake([
+            'https://api.openai.com/*' => Http::response(
+                $this->textResponse('What commander and budget do you want?'),
+                200
+            ),
+        ]);
+
+        $this->actingAs($this->user)
+            ->postJson("/api/chat/conversations/{$this->conversation->id}/messages", [
+                'message' => 'Build me a commander deck under $100',
+            ]);
+
+        Http::assertSent(function (Request $request): bool {
+            if ($request->url() !== 'https://api.openai.com/v1/chat/completions') {
+                return false;
+            }
+
+            $messages = $request->data()['messages'] ?? [];
+            $systemMessage = collect($messages)->firstWhere('role', 'system');
+            $content = $systemMessage['content'] ?? '';
+
+            return str_contains($content, "Treat the user's budget as a target, not a hard cap.")
+                && str_contains($content, 'A small overshoot is acceptable if it keeps the deck coherent or avoids a major downgrade.')
+                && str_contains($content, 'keep bought cards within the smaller of $15 or 10% over the stated budget');
+        });
+    }
+
+    public function test_existing_deck_prompt_includes_finish_this_deck_rules(): void
+    {
+        $deck = Deck::factory()->create([
+            'user_id' => $this->user->id,
+            'name' => 'Cheap Finish Test',
+            'format' => 'commander',
+        ]);
+        $this->conversation->update(['deck_id' => $deck->id]);
+
+        Http::fake([
+            'https://api.openai.com/*' => Http::response(
+                $this->textResponse('I can help finish this deck.'),
+                200
+            ),
+        ]);
+
+        $this->actingAs($this->user)
+            ->postJson("/api/chat/conversations/{$this->conversation->id}/messages", [
+                'message' => 'Finish this deck as cheaply as possible.',
+            ]);
+
+        Http::assertSent(function (Request $request): bool {
+            if ($request->url() !== 'https://api.openai.com/v1/chat/completions') {
+                return false;
+            }
+
+            $messages = $request->data()['messages'] ?? [];
+            $systemMessage = collect($messages)->firstWhere('role', 'system');
+            $content = $systemMessage['content'] ?? '';
+
+            return str_contains($content, 'When the user asks to "finish this deck", "complete this deck", or "finish this deck as cheaply as possible":')
+                && str_contains($content, 'Keep the current deck list fixed unless the user explicitly asks for upgrades or swaps.')
+                && str_contains($content, 'Call propose_changes with buy_cards for the exact missing cards needed to complete the deck.');
+        });
+    }
+
     // -------------------------------------------------------------------------
     // Card-count validation + retry
     // -------------------------------------------------------------------------
@@ -351,6 +417,135 @@ class AiDeckBuilderTest extends TestCase
         // Only one draft saved (the valid one from call_2); plus the attached improvement deck = 2 total
         $this->assertDatabaseCount('decks', 2);
         $this->assertDatabaseHas('decks', ['is_draft' => true]);
+    }
+
+    public function test_commander_deck_with_99_cards_is_auto_completed_to_100(): void
+    {
+        $commander = $this->makeCard('Talrand, Sky Summoner', 'Legendary Creature — Merfolk Wizard', 0, priceUsd: 1.00);
+        $commander->update(['color_identity' => ['U']]);
+
+        $this->makeCard('Island', 'Basic Land — Island', 0, priceUsd: 0.02)
+            ->update(['color_identity' => ['U']]);
+
+        $deckCards = [
+            ['card_name' => 'Talrand, Sky Summoner', 'quantity' => 1, 'role' => 'commander'],
+            ['card_name' => 'Island', 'quantity' => 24, 'role' => 'land'],
+        ];
+
+        $this->makeCard('Wastes', 'Basic Land — Wastes', 0, priceUsd: 0.02)
+            ->update(['color_identity' => []]);
+        $deckCards[] = ['card_name' => 'Wastes', 'quantity' => 14, 'role' => 'land'];
+
+        for ($i = 1; $i <= 60; $i++) {
+            $card = $this->makeCard("Blue Spell {$i}", 'Instant', 0, priceUsd: 0.10);
+            $card->update(['color_identity' => ['U']]);
+            $deckCards[] = ['card_name' => "Blue Spell {$i}", 'quantity' => 1, 'role' => 'spell'];
+        }
+
+        Http::fake([
+            'https://api.openai.com/*' => Http::sequence()
+                ->push($this->toolCallResponse('propose_deck', [
+                    'deck_name' => 'Talrand Spells',
+                    'format' => 'commander',
+                    'color_identity' => ['U'],
+                    'cards' => $deckCards,
+                ], 'call_1'), 200)
+                ->push($this->textResponse('Here is your deck.'), 200),
+            'https://api.scryfall.com/*' => Http::response([], 404),
+        ]);
+
+        $response = $this->actingAs($this->user)
+            ->postJson("/api/chat/conversations/{$this->conversation->id}/messages", [
+                'message' => 'Build me a Talrand commander deck under $100',
+            ]);
+
+        $response->assertOk();
+        $proposal = $response->json('deck_proposal');
+        $this->assertNotNull($proposal);
+        $this->assertNull($proposal['validation_message'] ?? null);
+        $this->assertEquals(100, array_sum(array_column($proposal['cards'], 'quantity')));
+
+        $island = collect($proposal['cards'])->firstWhere('name', 'Island');
+        $this->assertNotNull($island);
+        $this->assertEquals(25, $island['quantity']);
+    }
+
+    public function test_new_commander_deck_proposal_returns_baseline_and_replacement_buckets(): void
+    {
+        $commander = $this->makeCard('Syr Konrad, the Grim', 'Legendary Creature — Human Knight', 0, priceUsd: 1.50);
+        $commander->update(['color_identity' => ['B']]);
+
+        $artist = $this->makeCard('Blood Artist', 'Creature — Vampire', 0, priceUsd: 3.00);
+        $artist->update(['color_identity' => ['B']]);
+
+        $cutthroat = $this->makeCard('Zulaport Cutthroat', 'Creature — Human Rogue Ally', 1, priceUsd: 1.25);
+        $cutthroat->update(['color_identity' => ['B']]);
+
+        $reaper = $this->makeCard('Reassembling Skeleton', 'Creature — Skeleton Warrior', 0, priceUsd: 0.75);
+        $reaper->update(['color_identity' => ['B']]);
+
+        $swamp = $this->makeCard('Swamp', 'Basic Land — Swamp', 30, priceUsd: 0.02);
+        $swamp->update(['color_identity' => ['B']]);
+        $wastes = $this->makeCard('Wastes', 'Basic Land — Wastes', 0, priceUsd: 0.02);
+        $wastes->update(['color_identity' => []]);
+
+        $cards = [
+            ['card_name' => 'Syr Konrad, the Grim', 'quantity' => 1, 'role' => 'commander'],
+            ['card_name' => 'Blood Artist', 'quantity' => 1, 'role' => 'drain'],
+            ['card_name' => 'Zulaport Cutthroat', 'quantity' => 1, 'role' => 'drain'],
+            ['card_name' => 'Reassembling Skeleton', 'quantity' => 1, 'role' => 'fodder'],
+            ['card_name' => 'Swamp', 'quantity' => 25, 'role' => 'land'],
+            ['card_name' => 'Wastes', 'quantity' => 12, 'role' => 'land'],
+        ];
+
+        for ($i = 1; $i <= 59; $i++) {
+            $filler = $this->makeCard("Black Filler {$i}", 'Creature — Skeleton', 0, priceUsd: 0.10);
+            $filler->update(['color_identity' => ['B']]);
+            $cards[] = ['card_name' => "Black Filler {$i}", 'quantity' => 1, 'role' => 'aristocrats_support'];
+        }
+
+        Http::fake([
+            'https://api.openai.com/*' => Http::sequence()
+                ->push($this->toolCallResponse('propose_deck', [
+                    'deck_name' => 'Konrad Aristocrats',
+                    'format' => 'commander',
+                    'color_identity' => ['B'],
+                    'strategy_summary' => 'A collection-adapted aristocrats list.',
+                    'cards' => $cards,
+                    'baseline_kept_cards' => [
+                        ['card_name' => 'Syr Konrad, the Grim', 'quantity' => 1, 'role' => 'commander'],
+                        ['card_name' => 'Blood Artist', 'quantity' => 1, 'role' => 'drain'],
+                        ['card_name' => 'Reassembling Skeleton', 'quantity' => 1, 'role' => 'fodder'],
+                    ],
+                    'owned_replacement_cards' => [
+                        ['card_name' => 'Zulaport Cutthroat', 'quantity' => 1, 'role' => 'drain', 'reason' => 'Owned replacement for an unowned baseline drain payoff.'],
+                    ],
+                ], 'call_1'), 200)
+                ->push($this->textResponse('Here is your Commander deck.'), 200),
+            'https://api.scryfall.com/*' => Http::response([], 404),
+        ]);
+
+        $response = $this->actingAs($this->user)
+            ->postJson("/api/chat/conversations/{$this->conversation->id}/messages", [
+                'message' => 'Build me a Syr Konrad aristocrats commander deck under $100',
+            ]);
+
+        $response->assertOk();
+        $proposal = $response->json('deck_proposal');
+        $this->assertNotNull($proposal);
+
+        $this->assertCount(3, $proposal['baseline_kept_cards']);
+        $this->assertEquals('Syr Konrad, the Grim', $proposal['baseline_kept_cards'][0]['name']);
+
+        $this->assertCount(1, $proposal['owned_replacement_cards']);
+        $this->assertEquals('Zulaport Cutthroat', $proposal['owned_replacement_cards'][0]['name']);
+        $this->assertEquals(1, $proposal['owned_replacement_cards'][0]['owned_quantity']);
+
+        $this->assertGreaterThanOrEqual(2, count($proposal['missing_cards_to_buy']));
+        $missingNames = collect($proposal['missing_cards_to_buy'])->pluck('name')->all();
+        $this->assertContains('Blood Artist', $missingNames);
+        $this->assertContains('Reassembling Skeleton', $missingNames);
+        $this->assertNotContains('Zulaport Cutthroat', $missingNames);
     }
 
     public function test_new_deck_build_exits_gracefully_when_search_loop_repeats(): void
@@ -650,7 +845,7 @@ class AiDeckBuilderTest extends TestCase
         );
     }
 
-    public function test_commander_guide_returns_commander_card_data_even_without_sample_deck(): void
+    public function test_commander_guide_returns_commander_card_data_and_requested_archetype_even_without_sample_deck(): void
     {
         Card::factory()->create([
             'name' => 'Syr Konrad, the Grim',
@@ -664,6 +859,7 @@ class AiDeckBuilderTest extends TestCase
             'https://api.openai.com/*' => Http::sequence()
                 ->push($this->toolCallResponse('get_commander_guide', [
                     'commander_name' => 'Syr Konrad, the Grim',
+                    'archetype' => 'aristocrats',
                 ], 'call_1'), 200)
                 ->push($this->textResponse('I see Syr Konrad is mono-black.'), 200),
             'https://api.scryfall.com/*' => Http::response([], 404),
@@ -683,6 +879,7 @@ class AiDeckBuilderTest extends TestCase
         $this->assertFalse($payload['found']);
         $this->assertEquals(['B'], $payload['commander']['color_identity']);
         $this->assertEquals('Syr Konrad, the Grim', $payload['commander']['name']);
+        $this->assertEquals('aristocrats', $payload['requested_archetype']);
     }
 
     public function test_existing_deck_context_can_be_loaded_for_upgrade_advice(): void
@@ -758,7 +955,7 @@ class AiDeckBuilderTest extends TestCase
                         ['card_name' => 'Cancel', 'quantity' => 2, 'role' => 'interaction'],
                     ],
                     'buy_cards' => [
-                        ['card_name' => 'Mystic Confluence', 'quantity' => 1, 'priority' => 'must-buy', 'category' => 'upgrade'],
+                        ['card_name' => 'Mystic Confluence', 'quantity' => 1, 'priority' => 'must-buy', 'category' => 'upgrade', 'reason' => 'A flexible instant-speed finisher for long games.'],
                     ],
                 ], 'call_1'), 200)
                 ->push($this->textResponse('Swap Cancel for Counterspell.'), 200),
@@ -786,6 +983,9 @@ class AiDeckBuilderTest extends TestCase
         $this->assertEquals(3.0, $proposal['buy_list']['recommended_total']);
         $this->assertCount(1, $proposal['buy_list']['groups']['must_buy']);
         $this->assertEquals('Mystic Confluence', $proposal['buy_list']['groups']['must_buy'][0]['name']);
+        $this->assertEquals('A flexible instant-speed finisher for long games.', $proposal['buy_list']['groups']['must_buy'][0]['explanation_summary']);
+        $this->assertEquals('synergy', $proposal['buy_list']['groups']['must_buy'][0]['reason_type']);
+        $this->assertEquals('included', $proposal['buy_list']['groups']['must_buy'][0]['budget_status']);
     }
 
     public function test_deck_upgrade_proposal_retries_when_change_cards_are_unresolved(): void
