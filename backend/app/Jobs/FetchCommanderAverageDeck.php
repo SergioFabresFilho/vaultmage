@@ -48,6 +48,14 @@ class FetchCommanderAverageDeck implements ShouldQueue
         'midrange',
     ];
 
+    /**
+     * @return array<int, string>
+     */
+    public static function supportedArchetypes(): array
+    {
+        return self::SUPPORTED_ARCHETYPES;
+    }
+
     public function __construct(
         public readonly string $commanderName,
         public readonly string $commanderSlug,
