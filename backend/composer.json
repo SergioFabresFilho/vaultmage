@@ -10,6 +10,7 @@
         "dedoc/scramble": "^0.13.17",
         "google/cloud-vision": "^2.2",
         "laravel/framework": "^13.0",
+        "laravel/nightwatch": "^1.26",
         "laravel/sanctum": "^4.0",
         "laravel/tinker": "^3.0"
     },
