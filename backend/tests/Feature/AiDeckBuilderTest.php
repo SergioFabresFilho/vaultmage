@@ -6,6 +6,7 @@ use App\Models\Card;
 use App\Models\Conversation;
 use App\Models\Deck;
 use App\Models\Message;
+use App\Models\SampleDeck;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
@@ -880,6 +881,118 @@ class AiDeckBuilderTest extends TestCase
         $this->assertEquals(['B'], $payload['commander']['color_identity']);
         $this->assertEquals('Syr Konrad, the Grim', $payload['commander']['name']);
         $this->assertEquals('aristocrats', $payload['requested_archetype']);
+    }
+
+    public function test_commander_guide_prefers_exact_archetype_sample_when_cached(): void
+    {
+        Card::factory()->create([
+            'name' => 'Syr Konrad, the Grim',
+            'type_line' => 'Legendary Creature — Human Knight',
+            'mana_cost' => '{3}{B}{B}',
+            'color_identity' => ['B'],
+        ]);
+
+        SampleDeck::create([
+            'source' => 'edhrec',
+            'format' => 'commander',
+            'commander_name' => 'Syr Konrad, the Grim',
+            'commander_slug' => 'syr-konrad-the-grim',
+            'budget_tier' => 'budget',
+            'archetype' => 'aristocrats',
+            'cards' => [
+                ['name' => 'Blood Artist', 'quantity' => 1],
+                ['name' => 'Zulaport Cutthroat', 'quantity' => 1],
+            ],
+            'fetched_at' => now(),
+        ]);
+
+        SampleDeck::create([
+            'source' => 'edhrec',
+            'format' => 'commander',
+            'commander_name' => 'Syr Konrad, the Grim',
+            'commander_slug' => 'syr-konrad-the-grim',
+            'budget_tier' => 'budget',
+            'archetype' => 'generic',
+            'cards' => [
+                ['name' => 'Sign in Blood', 'quantity' => 1],
+            ],
+            'fetched_at' => now(),
+        ]);
+
+        Http::fake([
+            'https://api.openai.com/*' => Http::sequence()
+                ->push($this->toolCallResponse('get_commander_guide', [
+                    'commander_name' => 'Syr Konrad, the Grim',
+                    'budget_tier' => 'budget',
+                    'archetype' => 'aristocrats',
+                ], 'call_1'), 200)
+                ->push($this->textResponse('Using the aristocrats baseline.'), 200),
+            'https://api.scryfall.com/*' => Http::response([], 404),
+        ]);
+
+        $response = $this->actingAs($this->user)
+            ->postJson("/api/chat/conversations/{$this->conversation->id}/messages", [
+                'message' => 'Build me a Syr Konrad aristocrats deck on a budget',
+            ]);
+
+        $response->assertOk();
+
+        $toolMessage = $this->conversation->fresh()->messages()->where('role', 'tool')->first();
+        $payload = json_decode($toolMessage->content, true);
+
+        $this->assertTrue($payload['found']);
+        $this->assertEquals('aristocrats', $payload['resolved_archetype']);
+        $this->assertEquals('exact_archetype', $payload['sample_match']);
+        $this->assertEquals('Blood Artist', $payload['cards'][0]['name']);
+    }
+
+    public function test_commander_guide_falls_back_to_generic_sample_when_exact_archetype_is_missing(): void
+    {
+        Card::factory()->create([
+            'name' => 'Syr Konrad, the Grim',
+            'type_line' => 'Legendary Creature — Human Knight',
+            'mana_cost' => '{3}{B}{B}',
+            'color_identity' => ['B'],
+        ]);
+
+        SampleDeck::create([
+            'source' => 'edhrec',
+            'format' => 'commander',
+            'commander_name' => 'Syr Konrad, the Grim',
+            'commander_slug' => 'syr-konrad-the-grim',
+            'budget_tier' => 'budget',
+            'archetype' => 'generic',
+            'cards' => [
+                ['name' => 'Sign in Blood', 'quantity' => 1],
+            ],
+            'fetched_at' => now(),
+        ]);
+
+        Http::fake([
+            'https://api.openai.com/*' => Http::sequence()
+                ->push($this->toolCallResponse('get_commander_guide', [
+                    'commander_name' => 'Syr Konrad, the Grim',
+                    'budget_tier' => 'budget',
+                    'archetype' => 'reanimator',
+                ], 'call_1'), 200)
+                ->push($this->textResponse('Using the generic fallback baseline.'), 200),
+            'https://api.scryfall.com/*' => Http::response([], 404),
+        ]);
+
+        $response = $this->actingAs($this->user)
+            ->postJson("/api/chat/conversations/{$this->conversation->id}/messages", [
+                'message' => 'Build me a Syr Konrad reanimator deck on a budget',
+            ]);
+
+        $response->assertOk();
+
+        $toolMessage = $this->conversation->fresh()->messages()->where('role', 'tool')->first();
+        $payload = json_decode($toolMessage->content, true);
+
+        $this->assertTrue($payload['found']);
+        $this->assertEquals('generic', $payload['resolved_archetype']);
+        $this->assertEquals('generic_budget_fallback', $payload['sample_match']);
+        $this->assertEquals('Sign in Blood', $payload['cards'][0]['name']);
     }
 
     public function test_existing_deck_context_can_be_loaded_for_upgrade_advice(): void

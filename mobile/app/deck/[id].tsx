@@ -92,6 +92,11 @@ type BuyListItem = {
   line_total: number | null;
   is_commander: boolean;
   is_sideboard: boolean;
+  priority: 'must-buy' | 'upgrade';
+  category: string | null;
+  reason_type: string;
+  explanation_summary: string;
+  budget_status: 'included' | 'deferred_for_budget' | 'unpriced' | 'not_applicable';
 };
 
 type BuyList = {
@@ -106,8 +111,16 @@ type BuyList = {
   budget: number | null;
   budget_remaining: number | null;
   recommended_total: number;
+  cheapest_completion: {
+    items: BuyListItem[];
+    missing_cards_count: number;
+    estimated_total: number;
+    priced_items_count: number;
+    unpriced_items_count: number;
+  };
   groups: {
     must_buy: BuyListItem[];
+    upgrade: BuyListItem[];
     optional: BuyListItem[];
     deferred: BuyListItem[];
   };
@@ -214,7 +227,7 @@ function ownershipStyle(card: Card) {
 function buildBuyListExportText(buyList: BuyList): string {
   const sections = [
     { label: 'Must Buy', items: buyList.groups.must_buy },
-    { label: 'Optional', items: buyList.groups.optional },
+    { label: 'Upgrade', items: buyList.groups.upgrade },
     { label: 'Deferred', items: buyList.groups.deferred },
   ];
 
@@ -223,6 +236,10 @@ function buildBuyListExportText(buyList: BuyList): string {
     buyList.format ? `Format: ${buyList.format}` : null,
     `Missing cards: ${buyList.missing_cards_count}`,
     `Estimated total: $${buyList.estimated_total.toFixed(2)}`,
+    `Cheapest completion: $${buyList.cheapest_completion.estimated_total.toFixed(2)}`,
+    buyList.cheapest_completion.unpriced_items_count > 0
+      ? `Completion path has ${buyList.cheapest_completion.unpriced_items_count} unpriced item${buyList.cheapest_completion.unpriced_items_count === 1 ? '' : 's'}.`
+      : null,
     buyList.budget != null ? `Budget: $${buyList.budget.toFixed(2)}` : null,
     buyList.budget != null ? `Recommended total: $${buyList.recommended_total.toFixed(2)}` : null,
     buyList.budget_remaining != null ? `Budget remaining: $${buyList.budget_remaining.toFixed(2)}` : null,
@@ -242,7 +259,7 @@ function buildBuyListExportText(buyList: BuyList): string {
             ? ` - $${item.line_total.toFixed(2)} total`
             : ' - no price';
 
-          return `${item.missing_quantity}x ${item.name}${priceText}`;
+          return `${item.missing_quantity}x ${item.name}${priceText}${item.explanation_summary ? ` — ${item.explanation_summary}` : ''}`;
         }),
         '',
       ];
@@ -259,9 +276,28 @@ function buyListItemCategory(item: BuyListItem): string {
 }
 
 function buyListItemPriority(item: BuyListItem): string {
-  if (item.is_commander) return 'must-buy';
-  if (item.is_sideboard) return 'optional';
-  return 'must-buy';
+  return item.priority;
+}
+
+function buyListSectionCopy(key: 'must_buy' | 'upgrade' | 'deferred'): string {
+  if (key === 'must_buy') return 'Required to finish the current deck list.';
+  if (key === 'upgrade') return 'Helpful improvements that are not required for completion.';
+  return 'Cards that did not fit the current budget or recommendation window.';
+}
+
+function buyListStatusLabel(item: BuyListItem): string | null {
+  if (item.budget_status === 'deferred_for_budget') return 'Deferred by budget';
+  if (item.budget_status === 'unpriced') return 'Missing price data';
+  if (item.priority === 'must-buy') return 'Required';
+  if (item.priority === 'upgrade') return 'Upgrade';
+  return null;
+}
+
+function buyListStatusStyle(item: BuyListItem) {
+  if (item.budget_status === 'deferred_for_budget') return styles.buyListStatusDeferred;
+  if (item.budget_status === 'unpriced') return styles.buyListStatusUnpriced;
+  if (item.priority === 'must-buy') return styles.buyListStatusRequired;
+  return styles.buyListStatusUpgrade;
 }
 
 function csvEscape(value: string | number | boolean | null): string {
@@ -742,6 +778,14 @@ export default function DeckViewScreen() {
                   {buyList?.missing_cards_count ?? 0} missing card{(buyList?.missing_cards_count ?? 0) === 1 ? '' : 's'}
                 </Text>
                 <Text style={styles.buyListSummaryTotal}>Estimated total: ${(buyList?.estimated_total ?? 0).toFixed(2)}</Text>
+                <Text style={styles.buyListSummaryMeta}>
+                  Cheapest completion: ${(buyList?.cheapest_completion.estimated_total ?? 0).toFixed(2)}
+                </Text>
+                {(buyList?.cheapest_completion.unpriced_items_count ?? 0) > 0 ? (
+                  <Text style={styles.buyListSummaryMeta}>
+                    Completion path has {buyList?.cheapest_completion.unpriced_items_count} unpriced item{buyList?.cheapest_completion.unpriced_items_count === 1 ? '' : 's'}.
+                  </Text>
+                ) : null}
                 <View style={styles.budgetChipRow}>
                   {[
                     { label: 'No budget', value: null },
@@ -795,13 +839,14 @@ export default function DeckViewScreen() {
 
               {buyList?.items.length ? (
                 [
-                  { key: 'must_buy', title: 'Must Buy', items: buyList.groups.must_buy },
-                  { key: 'optional', title: 'Optional', items: buyList.groups.optional },
-                  { key: 'deferred', title: 'Deferred', items: buyList.groups.deferred },
+                  { key: 'must_buy' as const, title: 'Must Buy', items: buyList.groups.must_buy },
+                  { key: 'upgrade' as const, title: 'Upgrade', items: buyList.groups.upgrade },
+                  { key: 'deferred' as const, title: 'Deferred', items: buyList.groups.deferred },
                 ].map((section) => (
                   section.items.length ? (
                     <View key={section.key} style={styles.buyListSection}>
                       <Text style={styles.buyListSectionTitle}>{section.title}</Text>
+                      <Text style={styles.buyListSectionHint}>{buyListSectionCopy(section.key)}</Text>
                       {section.items.map((item) => (
                         <View key={`${section.key}-${item.card_id}-${item.name}`} style={styles.buyListItem}>
                           {item.image_uri ? (
@@ -813,9 +858,15 @@ export default function DeckViewScreen() {
                           )}
                           <View style={styles.buyListInfo}>
                             <Text style={styles.buyListName}>{item.name}</Text>
+                            {buyListStatusLabel(item) ? (
+                              <View style={[styles.buyListStatusPill, buyListStatusStyle(item)]}>
+                                <Text style={styles.buyListStatusText}>{buyListStatusLabel(item)}</Text>
+                              </View>
+                            ) : null}
                             <Text style={styles.buyListMeta}>
                               Need {item.missing_quantity} · Own {item.owned_quantity} / {item.quantity_required}
                             </Text>
+                            <Text style={styles.buyListExplanation}>{item.explanation_summary}</Text>
                             <Text style={styles.buyListType} numberOfLines={1}>{item.type_line}</Text>
                           </View>
                           <View style={styles.buyListPriceCol}>
@@ -1149,6 +1200,7 @@ const styles = StyleSheet.create({
     letterSpacing: 0.6,
     marginBottom: 8,
   },
+  buyListSectionHint: { color: '#8f8aa3', fontSize: 12, marginBottom: 10, lineHeight: 17 },
   buyListExportBtn: {
     backgroundColor: '#6C3CE1',
     borderRadius: 999,
@@ -1177,7 +1229,34 @@ const styles = StyleSheet.create({
   },
   buyListInfo: { flex: 1 },
   buyListName: { color: '#fff', fontSize: 14, fontWeight: '700' },
+  buyListStatusPill: {
+    alignSelf: 'flex-start',
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    marginTop: 6,
+    marginBottom: 2,
+    borderWidth: 1,
+  },
+  buyListStatusRequired: {
+    backgroundColor: 'rgba(125, 206, 160, 0.16)',
+    borderColor: 'rgba(125, 206, 160, 0.35)',
+  },
+  buyListStatusUpgrade: {
+    backgroundColor: 'rgba(108, 60, 225, 0.18)',
+    borderColor: 'rgba(108, 60, 225, 0.35)',
+  },
+  buyListStatusDeferred: {
+    backgroundColor: 'rgba(255, 140, 140, 0.16)',
+    borderColor: 'rgba(255, 140, 140, 0.35)',
+  },
+  buyListStatusUnpriced: {
+    backgroundColor: 'rgba(255, 179, 107, 0.16)',
+    borderColor: 'rgba(255, 179, 107, 0.35)',
+  },
+  buyListStatusText: { color: '#f3eee8', fontSize: 10, fontWeight: '800', textTransform: 'uppercase' },
   buyListMeta: { color: '#f3eee8', fontSize: 12, marginTop: 4 },
+  buyListExplanation: { color: '#c9c2d6', fontSize: 12, marginTop: 4, lineHeight: 17 },
   buyListType: { color: '#888', fontSize: 12, marginTop: 2 },
   buyListPriceCol: { alignItems: 'flex-end', marginLeft: 12 },
   buyListLineTotal: { color: '#7dcea0', fontSize: 13, fontWeight: '700' },

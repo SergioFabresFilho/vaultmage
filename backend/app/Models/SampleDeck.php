@@ -12,6 +12,7 @@ class SampleDeck extends Model
         'commander_name',
         'commander_slug',
         'budget_tier',
+        'archetype',
         'cards',
         'fetched_at',
     ];

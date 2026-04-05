@@ -152,4 +152,4 @@ After this slice:
 
 - manual UX validation across owned, partial-owned, and fully missing deck scenarios
 - refactor shared ownership and buy-list logic into reusable backend helpers/services
-- continue commercialization work from [`commercialization-implementation-todo.md`](/Users/sergiosanchesfabresfilho/ssff/ssff/vaultmage/commercialization-implementation-todo.md)
+- continue commercialization work from [`02-commercialization-implementation-todo.md`](/Users/sergiosanchesfabresfilho/ssff/ssff/vaultmage/specs/02-commercialization-implementation-todo.md)

@@ -4,12 +4,17 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Deck;
+use App\Services\BuyListFormatter;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use RuntimeException;
 
 class DeckController extends Controller
 {
+    public function __construct(private BuyListFormatter $buyListFormatter)
+    {
+    }
+
     /**
      * Display a listing of the resource.
      */
@@ -187,84 +192,23 @@ class DeckController extends Controller
                     'line_total' => $unitPrice !== null ? round($unitPrice * $missing, 2) : null,
                     'is_commander' => (bool) $card->pivot->is_commander,
                     'is_sideboard' => (bool) $card->pivot->is_sideboard,
-                    'priority' => (bool) $card->pivot->is_sideboard ? 'optional' : 'must-buy',
+                    'priority' => (bool) $card->pivot->is_sideboard ? 'upgrade' : 'must-buy',
                     'category' => (bool) $card->pivot->is_commander
                         ? 'commander'
                         : ((bool) $card->pivot->is_sideboard ? 'sideboard' : 'mainboard'),
+                    'reason_type' => (bool) $card->pivot->is_sideboard ? 'sideboard_upgrade' : 'deck_completion',
                 ];
             })
             ->filter()
-            ->sortBy(fn (array $item) => [
-                $item['is_commander'] ? 0 : ($item['is_sideboard'] ? 2 : 1),
-                $item['line_total'] === null ? 1 : 0,
-                $item['line_total'] ?? PHP_FLOAT_MAX,
-                -1 * $item['missing_quantity'],
-            ])
             ->values();
 
-        $pricedItems = $items->filter(fn (array $item) => $item['line_total'] !== null);
-        $mustBuyItems = $items->filter(fn (array $item) => $item['priority'] === 'must-buy')->values();
-        $optionalItems = $items->filter(fn (array $item) => $item['priority'] === 'optional')->values();
-
-        $recommended = collect();
-        $deferred = collect();
-        $budgetRemaining = $budget;
-
-        foreach ($mustBuyItems as $item) {
-            if ($budgetRemaining === null || $item['line_total'] === null) {
-                $recommended->push($item);
-                continue;
-            }
-
-            if ($item['line_total'] <= $budgetRemaining) {
-                $recommended->push($item);
-                $budgetRemaining = round($budgetRemaining - $item['line_total'], 2);
-            } else {
-                $deferred->push($item);
-            }
-        }
-
-        foreach ($optionalItems as $item) {
-            if ($budgetRemaining === null) {
-                $deferred->push($item);
-                continue;
-            }
-
-            if ($item['line_total'] === null) {
-                $deferred->push($item);
-                continue;
-            }
-
-            if ($item['line_total'] <= $budgetRemaining) {
-                $recommended->push($item);
-                $budgetRemaining = round($budgetRemaining - $item['line_total'], 2);
-            } else {
-                $deferred->push($item);
-            }
-        }
-
-        $recommendedIds = $recommended->pluck('card_id')->all();
-        $grouped = [
-            'must_buy' => $recommended->filter(fn (array $item) => $item['priority'] === 'must-buy')->values()->all(),
-            'optional' => $recommended->filter(fn (array $item) => $item['priority'] === 'optional')->values()->all(),
-            'deferred' => $items->filter(fn (array $item) => ! in_array($item['card_id'], $recommendedIds, true))->values()->all(),
-        ];
-        $recommendedPriced = $recommended->filter(fn (array $item) => $item['line_total'] !== null);
+        $buyList = $this->buyListFormatter->build($items->all(), $budget);
 
         return response()->json([
             'deck_id' => $deck->id,
             'deck_name' => $deck->name,
             'format' => $deck->format,
-            'items' => $items->all(),
-            'missing_cards_count' => $items->sum('missing_quantity'),
-            'estimated_total' => round((float) $pricedItems->sum('line_total'), 2),
-            'priced_items_count' => $pricedItems->count(),
-            'unpriced_items_count' => $items->count() - $pricedItems->count(),
-            'budget' => $budget,
-            'budget_remaining' => $budgetRemaining,
-            'recommended_total' => round((float) $recommendedPriced->sum('line_total'), 2),
-            'groups' => $grouped,
-        ]);
+        ] + $buyList);
     }
 
     /**

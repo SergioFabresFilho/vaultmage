@@ -1398,35 +1398,22 @@ class AiChatService
             }
         }
 
-        // Try exact match for the requested tier first, then fuzzy name match,
-        // then fall back to 'average' if the specific tier isn't cached yet.
-        $sample = SampleDeck::where('commander_name', $commanderName)
-                ->where('budget_tier', $budgetTier)->first()
-            ?? SampleDeck::where('commander_name', 'like', '%' . $commanderName . '%')
-                ->where('budget_tier', $budgetTier)->first();
+        [$sample, $sampleMatch] = $this->findCommanderSampleDeck($commanderName, $budgetTier, $archetype);
 
         // If not cached, fetch from EDHREC inline (synchronous) and re-query.
         if (! $sample && $commanderCard) {
             $slug = $this->nameToEdhrecSlug($commanderCard->name);
             try {
-                FetchCommanderAverageDeck::dispatchSync($commanderCard->name, $slug, $budgetTier);
-                $sample = SampleDeck::where('commander_slug', $slug)
-                    ->where('budget_tier', $budgetTier)->first();
+                FetchCommanderAverageDeck::dispatchSync($commanderCard->name, $slug, $budgetTier, $archetype);
+                [$sample, $sampleMatch] = $this->findCommanderSampleDeck($commanderCard->name, $budgetTier, $archetype);
             } catch (\Throwable $e) {
                 Log::warning('AiChatService: inline EDHREC fetch failed', [
                     'commander'   => $commanderName,
                     'budget_tier' => $budgetTier,
+                    'archetype'   => $archetype,
                     'error'       => $e->getMessage(),
                 ]);
             }
-        }
-
-        // If the requested tier still isn't available, fall back to 'average'.
-        if (! $sample && $budgetTier !== 'average') {
-            $sample = SampleDeck::where('commander_name', $commanderName)
-                    ->where('budget_tier', 'average')->first()
-                ?? SampleDeck::where('commander_name', 'like', '%' . $commanderName . '%')
-                    ->where('budget_tier', 'average')->first();
         }
 
         if (! $sample) {
@@ -1470,6 +1457,8 @@ class AiChatService
             'commander_name' => $sample->commander_name,
             'budget_tier'    => $sample->budget_tier,
             'requested_archetype' => $archetype,
+            'resolved_archetype' => $sample->archetype,
+            'sample_match'   => $sampleMatch,
             'commander'      => $commanderCard ? [
                 'name'           => $commanderCard->name,
                 'type_line'      => $commanderCard->type_line,
@@ -1479,12 +1468,55 @@ class AiChatService
             ] : null,
             'source'         => 'EDHREC ' . $sample->budget_tier . ' deck (human-curated)',
             'archetype_note' => $archetype
-                ? "Use this as a {$archetype} baseline shell. Preserve the theme when choosing owned-card substitutions."
+                ? $sample->archetype === $archetype
+                    ? "Use this as an exact {$archetype} baseline shell. Preserve the theme when choosing owned-card substitutions."
+                    : "Requested archetype {$archetype} was not cached exactly. Use this {$sample->archetype} baseline as the closest fallback shell and preserve the requested theme when choosing substitutions."
                 : null,
             'fetched_at'     => $sample->fetched_at?->toDateString(),
             'total_cards'    => $sampleCards->sum('quantity'),
             'cards'          => $enrichedCards,
         ];
+    }
+
+    private function findCommanderSampleDeck(string $commanderName, string $budgetTier, ?string $archetype): array
+    {
+        $normalizedArchetype = $this->normalizeSampleDeckArchetype($archetype);
+
+        $queries = [
+            ['budget_tier' => $budgetTier, 'archetype' => $normalizedArchetype, 'match' => $normalizedArchetype === 'generic' ? 'exact_generic' : 'exact_archetype'],
+        ];
+
+        if ($normalizedArchetype !== 'generic') {
+            $queries[] = ['budget_tier' => 'average', 'archetype' => $normalizedArchetype, 'match' => 'archetype_average_fallback'];
+            $queries[] = ['budget_tier' => $budgetTier, 'archetype' => 'generic', 'match' => 'generic_budget_fallback'];
+        }
+
+        if ($budgetTier !== 'average' || $normalizedArchetype !== 'generic') {
+            $queries[] = ['budget_tier' => 'average', 'archetype' => 'generic', 'match' => 'generic_average_fallback'];
+        }
+
+        foreach ($queries as $query) {
+            $sample = SampleDeck::where('commander_name', $commanderName)
+                    ->where('budget_tier', $query['budget_tier'])
+                    ->where('archetype', $query['archetype'])
+                    ->first()
+                ?? SampleDeck::where('commander_name', 'like', '%' . $commanderName . '%')
+                    ->where('budget_tier', $query['budget_tier'])
+                    ->where('archetype', $query['archetype'])
+                    ->first();
+
+            if ($sample) {
+                return [$sample, $query['match']];
+            }
+        }
+
+        return [null, null];
+    }
+
+    private function normalizeSampleDeckArchetype(?string $archetype): string
+    {
+        $value = strtolower(trim((string) $archetype));
+        return $value !== '' ? $value : 'generic';
     }
 
     private function toolProposeDeck(array $args, User $user, Conversation $conversation): array

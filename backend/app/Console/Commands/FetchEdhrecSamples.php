@@ -10,7 +10,8 @@ class FetchEdhrecSamples extends Command
 {
     protected $signature = 'decks:fetch-edhrec
                             {--limit=0 : Cap the number of jobs dispatched (0 = no limit, useful for testing)}
-                            {--fresh   : Re-fetch all commanders, including ones already stored}';
+                            {--fresh   : Re-fetch all commanders, including ones already stored}
+                            {--archetypes=generic : Comma-separated archetypes to fetch, e.g. generic,aristocrats,reanimator}';
 
     protected $description = 'Dispatch jobs to fetch EDHREC average Commander decks for AI training samples.';
 
@@ -18,6 +19,14 @@ class FetchEdhrecSamples extends Command
     {
         $limit = (int) $this->option('limit');
         $fresh = (bool) $this->option('fresh');
+        $archetypes = collect(explode(',', (string) $this->option('archetypes')))
+            ->map(fn ($value) => strtolower(trim($value)))
+            ->filter()
+            ->values();
+
+        if ($archetypes->isEmpty()) {
+            $archetypes = collect(['generic']);
+        }
 
         $query = Card::where(function ($q) {
                 $q->where('type_line', 'like', '%Legendary Creature%')
@@ -40,8 +49,15 @@ class FetchEdhrecSamples extends Command
 
         // When not doing a fresh run, skip commanders we already have data for
         if (! $fresh) {
-            $existing = \App\Models\SampleDeck::pluck('commander_name')->flip();
-            $commanders = $commanders->filter(fn ($name) => ! $existing->has($name));
+            $existing = \App\Models\SampleDeck::query()
+                ->get(['commander_name', 'archetype'])
+                ->groupBy('commander_name')
+                ->map(fn ($rows) => $rows->pluck('archetype')->unique()->values()->all());
+
+            $commanders = $commanders->filter(function ($name) use ($existing, $archetypes) {
+                $stored = collect($existing[$name] ?? []);
+                return $archetypes->some(fn ($archetype) => ! $stored->contains($archetype));
+            });
         }
 
         if ($commanders->isEmpty()) {
@@ -53,9 +69,11 @@ class FetchEdhrecSamples extends Command
 
         foreach ($commanders as $name) {
             $slug = $this->nameToSlug($name);
-            FetchCommanderAverageDeck::dispatch($name, $slug)
-                ->onQueue('edhrec');
-            $dispatched++;
+            foreach ($archetypes as $archetype) {
+                FetchCommanderAverageDeck::dispatch($name, $slug, 'average', $archetype === 'generic' ? null : $archetype)
+                    ->onQueue('edhrec');
+                $dispatched++;
+            }
         }
 
         $this->info(sprintf('Dispatched %d jobs on the [edhrec] queue.', $dispatched));

@@ -182,6 +182,10 @@ class DeckTest extends TestCase
             ->assertJsonPath('deck_name', 'Budget Deck')
             ->assertJsonPath('missing_cards_count', 6)
             ->assertJsonPath('estimated_total', 6)
+            ->assertJsonPath('cheapest_completion.missing_cards_count', 6)
+            ->assertJsonPath('cheapest_completion.estimated_total', 6)
+            ->assertJsonPath('cheapest_completion.priced_items_count', 2)
+            ->assertJsonPath('cheapest_completion.unpriced_items_count', 0)
             ->assertJsonPath('priced_items_count', 2)
             ->assertJsonPath('unpriced_items_count', 0)
             ->assertJsonCount(2, 'items')
@@ -189,12 +193,23 @@ class DeckTest extends TestCase
                 'name' => 'Partial Card',
                 'missing_quantity' => 2,
                 'line_total' => 3,
+                'priority' => 'must-buy',
+                'reason_type' => 'deck_completion',
+                'budget_status' => 'included',
             ])
             ->assertJsonFragment([
                 'name' => 'Missing Card',
                 'missing_quantity' => 4,
                 'line_total' => 3,
+                'priority' => 'must-buy',
             ]);
+
+        $partialCard = collect($response->json('items'))->firstWhere('name', 'Partial Card');
+        $this->assertNotNull($partialCard);
+        $this->assertSame(
+            'Required to complete this deck. You own 1 of 3 copies, so 2 still need to be purchased.',
+            $partialCard['explanation_summary']
+        );
     }
 
     public function test_buy_list_tracks_unpriced_missing_cards()
@@ -209,10 +224,15 @@ class DeckTest extends TestCase
         $response->assertStatus(200)
             ->assertJsonPath('missing_cards_count', 2)
             ->assertJsonPath('estimated_total', 0)
+            ->assertJsonPath('cheapest_completion.missing_cards_count', 2)
+            ->assertJsonPath('cheapest_completion.estimated_total', 0)
+            ->assertJsonPath('cheapest_completion.priced_items_count', 0)
+            ->assertJsonPath('cheapest_completion.unpriced_items_count', 1)
             ->assertJsonPath('priced_items_count', 0)
             ->assertJsonPath('unpriced_items_count', 1)
             ->assertJsonPath('items.0.missing_quantity', 2)
-            ->assertJsonPath('items.0.line_total', null);
+            ->assertJsonPath('items.0.line_total', null)
+            ->assertJsonPath('items.0.budget_status', 'unpriced');
     }
 
     public function test_buy_list_applies_budget_and_groups_recommendations()
@@ -232,10 +252,14 @@ class DeckTest extends TestCase
             ->assertJsonPath('budget', 2.5)
             ->assertJsonPath('budget_remaining', 0.5)
             ->assertJsonPath('recommended_total', 2)
+            ->assertJsonPath('cheapest_completion.estimated_total', 3)
+            ->assertJsonPath('cheapest_completion.missing_cards_count', 2)
             ->assertJsonCount(1, 'groups.must_buy')
+            ->assertJsonCount(1, 'groups.upgrade')
             ->assertJsonCount(1, 'groups.optional')
             ->assertJsonCount(1, 'groups.deferred')
             ->assertJsonPath('groups.must_buy.0.name', 'Commander Card')
+            ->assertJsonPath('groups.upgrade.0.name', 'Sideboard Card')
             ->assertJsonPath('groups.optional.0.name', 'Sideboard Card')
             ->assertJsonFragment([
                 'name' => 'Mainboard Card',
@@ -244,9 +268,12 @@ class DeckTest extends TestCase
             ])
             ->assertJsonFragment([
                 'name' => 'Sideboard Card',
-                'priority' => 'optional',
+                'priority' => 'upgrade',
                 'category' => 'sideboard',
-            ]);
+                'reason_type' => 'sideboard_upgrade',
+                'budget_status' => 'included',
+            ])
+            ->assertJsonPath('groups.deferred.0.budget_status', 'deferred_for_budget');
     }
 
     public function test_it_updates_a_deck()

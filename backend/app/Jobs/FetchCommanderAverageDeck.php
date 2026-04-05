@@ -34,10 +34,25 @@ class FetchCommanderAverageDeck implements ShouldQueue
         'Accept'     => 'application/json, */*',
     ];
 
+    private const SUPPORTED_ARCHETYPES = [
+        'aristocrats',
+        'aggro',
+        'tokens',
+        'spellslinger',
+        'reanimator',
+        'blink',
+        'sacrifice',
+        'ramp',
+        'control',
+        'combo',
+        'midrange',
+    ];
+
     public function __construct(
         public readonly string $commanderName,
         public readonly string $commanderSlug,
         public readonly string $budgetTier = 'average',
+        public readonly ?string $archetype = null,
     ) {}
 
     public function handle(): void
@@ -52,10 +67,7 @@ class FetchCommanderAverageDeck implements ShouldQueue
         ]);
 
         try {
-            $suffix = self::TIER_SUFFIXES[$this->budgetTier] ?? '';
-            $url    = sprintf(self::AVG_DECK_URL, $this->commanderSlug . $suffix);
-            $resp   = $client->get($url);
-            $data = json_decode((string) $resp->getBody(), true);
+            $data = $this->fetchDeckPayload($client);
         } catch (RequestException $e) {
             if ($e->getResponse() && in_array($e->getResponse()->getStatusCode(), [403, 404])) {
                 // No EDHREC page for this commander — not worth retrying
@@ -74,7 +86,11 @@ class FetchCommanderAverageDeck implements ShouldQueue
         }
 
         SampleDeck::updateOrCreate(
-            ['commander_slug' => $this->commanderSlug, 'budget_tier' => $this->budgetTier],
+            [
+                'commander_slug' => $this->commanderSlug,
+                'budget_tier' => $this->budgetTier,
+                'archetype' => $this->normalizedArchetype(),
+            ],
             [
                 'source'         => 'edhrec',
                 'format'         => 'commander',
@@ -87,8 +103,67 @@ class FetchCommanderAverageDeck implements ShouldQueue
         Log::debug('FetchCommanderAverageDeck: saved', [
             'commander'   => $this->commanderName,
             'budget_tier' => $this->budgetTier,
+            'archetype'   => $this->normalizedArchetype(),
             'cards'       => count($cards),
         ]);
+    }
+
+    private function fetchDeckPayload(GuzzleClient $client): array
+    {
+        $lastException = null;
+
+        foreach ($this->candidateUrls() as $url) {
+            try {
+                $resp = $client->get($url);
+                return json_decode((string) $resp->getBody(), true) ?? [];
+            } catch (RequestException $e) {
+                $lastException = $e;
+                if (! $e->getResponse() || ! in_array($e->getResponse()->getStatusCode(), [403, 404], true)) {
+                    throw $e;
+                }
+            }
+        }
+
+        if ($lastException) {
+            throw $lastException;
+        }
+
+        return [];
+    }
+
+    /**
+     * EDHREC does not publish a stable public archetype API. Try a few URL shapes
+     * observed from the site structure and fall back to the generic average-deck
+     * endpoint when no archetype-specific page exists.
+     *
+     * @return array<int, string>
+     */
+    private function candidateUrls(): array
+    {
+        $suffix = self::TIER_SUFFIXES[$this->budgetTier] ?? '';
+        $baseSlug = $this->commanderSlug . $suffix;
+        $archetype = $this->normalizedArchetype();
+
+        if ($archetype === 'generic') {
+            return [sprintf(self::AVG_DECK_URL, $baseSlug)];
+        }
+
+        return array_values(array_unique([
+            sprintf(self::AVG_DECK_URL, $baseSlug . '/' . $archetype),
+            sprintf(self::AVG_DECK_URL, $baseSlug . '-' . $archetype),
+            sprintf(self::AVG_DECK_URL, $baseSlug),
+        ]));
+    }
+
+    private function normalizedArchetype(): string
+    {
+        $archetype = strtolower(trim((string) $this->archetype));
+
+        if ($archetype === '' || ! in_array($archetype, self::SUPPORTED_ARCHETYPES, true)) {
+            return 'generic';
+        }
+
+        return $archetype;
     }
 
     /**
